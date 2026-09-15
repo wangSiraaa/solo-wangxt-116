@@ -1,0 +1,24 @@
+{
+  "name": "rehearsal-stand",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vue-tsc -b && vite build",
+    "test": "tsx scripts/smoke-test.ts",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "opensheetmusicdisplay": "^2.1.2",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.9",
+    "jsdom": "^29.1.1",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.2",
+    "vite": "^8.3.0",
+    "vue-tsc": "^3.3.11"
+  }
+}
