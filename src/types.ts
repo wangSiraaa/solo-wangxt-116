@@ -244,10 +244,12 @@ export interface QueuePosition {
   measureQuarter: number
   updatedAt: number
   completed: boolean
+  runId?: string
 }
 
 export interface QueueCompletion {
   id: string
+  runId?: string
   itemId: string
   segmentId: string
   segmentName: string
@@ -278,6 +280,8 @@ export interface PartQueue {
   items: PartQueueItem[]
   position: QueuePosition | null
   completions: QueueCompletion[]
+  activeRunId?: string
+  completedAllAt?: number
   createdAt: number
   updatedAt: number
 }

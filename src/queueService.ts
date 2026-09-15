@@ -151,37 +151,124 @@ export function updateQueueProgress(plan: RehearsalPlan, queueId: string, positi
   touchQueue(queue)
 }
 
-export function completeQueueItem(plan: RehearsalPlan, queueId: string, itemId: string): QueueCompletion | null {
+export function startQueueRun(queue: PartQueue, restart = false): string {
+  const runId = createId()
+  queue.activeRunId = runId
+  queue.completedAllAt = undefined
+  if (restart || !queue.position || queue.position.completed) {
+    const first = queue.items.find((item) => item.status === 'ready')
+    queue.position = first
+      ? {
+          queueId: queue.id,
+          itemId: first.id,
+          segmentId: first.segmentId,
+          visitKey: first.start.visitKey,
+          loopIndex: 0,
+          measureQuarter: 0,
+          updatedAt: Date.now(),
+          completed: false,
+          runId
+        }
+      : null
+  }
+  touchQueue(queue)
+  return runId
+}
+
+export function advanceQueueItem(
+  plan: RehearsalPlan,
+  queueId: string,
+  completedItemId: string,
+  runId: string | undefined
+): { status: 'next' | 'finished' | 'blocked'; position: QueuePosition | null } {
   const queue = plan.queues.find((candidate) => candidate.id === queueId)
-  const item = queue?.items.find((candidate) => candidate.id === itemId)
-  if (!queue || !item) return null
-  const completion: QueueCompletion = {
-    id: createId(),
+  const item = queue?.items.find((candidate) => candidate.id === completedItemId)
+  if (!queue || !item) return { status: 'blocked', position: null }
+
+  if (!queue.completions.some((completion) => completion.itemId === completedItemId && completion.runId === runId)) {
+    const completion: QueueCompletion = {
+      id: createId(),
+      runId,
+      itemId: item.id,
+      segmentId: item.segmentId,
+      segmentName: item.segmentName,
+      loops: item.loops,
+      tempoScale: item.tempoScale,
+      completedAt: Date.now()
+    }
+    queue.completions.push(completion)
+  }
+
+  const nextItemId = queue.position?.itemId
+  const currentIndex = queue.items.findIndex((candidate) => candidate.id === completedItemId)
+  const searchStart = nextItemId === completedItemId ? currentIndex + 1 : Math.max(0, currentIndex)
+  const next = queue.items.slice(searchStart).find((candidate) => candidate.status === 'ready')
+  const blocked = queue.items.slice(currentIndex + 1).find((candidate) => candidate.status !== 'ready')
+
+  if (next) {
+    const position: QueuePosition = {
+      queueId: queue.id,
+      itemId: next.id,
+      segmentId: next.segmentId,
+      visitKey: next.start.visitKey,
+      loopIndex: 0,
+      measureQuarter: 0,
+      updatedAt: Date.now(),
+      completed: false,
+      runId
+    }
+    queue.position = position
+    queue.completedAllAt = undefined
+    touchQueue(queue)
+    return { status: 'next', position }
+  }
+
+  const finalPosition: QueuePosition = {
+    queueId: queue.id,
     itemId: item.id,
     segmentId: item.segmentId,
-    segmentName: item.segmentName,
-    loops: item.loops,
-    tempoScale: item.tempoScale,
-    completedAt: Date.now()
+    visitKey: item.end.visitKey,
+    loopIndex: Math.max(0, item.loops - 1),
+    measureQuarter: 0,
+    updatedAt: Date.now(),
+    completed: true,
+    runId
   }
-  queue.completions.push(completion)
-  queue.position = null
+  queue.position = finalPosition
+  if (!blocked) queue.completedAllAt = Date.now()
   touchQueue(queue)
-  return completion
+  return { status: blocked ? 'blocked' : 'finished', position: finalPosition }
 }
 
-export function queueItemFromSegment(segment: RehearsalSegment, loops = segment.loops, tempoScale = 1): PartQueueItem {
-  return createQueueItem(segment, loops, tempoScale)
-}
-
-export function queueSummary(queue: PartQueue): { next: PartQueueItem | null; completed: number; pending: number; ready: number } {
+export function queueSummary(queue: PartQueue): {
+  next: PartQueueItem | null
+  completed: number
+  pending: number
+  ready: number
+  blocked: number
+  finished: boolean
+} {
   const pending = queue.items.filter((item) => item.status === 'pending').length
-  const next = queue.items.find((item) => item.status !== 'historical' && item.status !== 'pending') ?? null
+  const historical = queue.items.filter((item) => item.status === 'historical').length
+  const currentItemId = queue.position?.itemId
+  const currentIndex = queue.items.findIndex((item) => item.id === currentItemId)
+  const next =
+    queue.position?.completed
+      ? null
+      : queue.items.slice(Math.max(0, currentIndex)).find((item) => item.status === 'ready') ??
+        queue.items.find((item) => item.status === 'ready') ??
+        null
+  const runId = queue.position?.runId ?? queue.activeRunId
+  const completedThisRun = runId
+    ? queue.completions.filter((completion) => completion.runId === runId).length
+    : queue.completions.length
   return {
     next,
-    completed: queue.completions.length,
+    completed: completedThisRun,
     pending,
-    ready: queue.items.filter((item) => item.status === 'ready').length
+    ready: queue.items.filter((item) => item.status === 'ready').length,
+    blocked: pending + historical,
+    finished: !!queue.completedAllAt
   }
 }
 

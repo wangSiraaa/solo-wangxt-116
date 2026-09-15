@@ -4,6 +4,7 @@ export interface MetronomeOptions {
   audio: AudioContext
   onPulse?: (pulse: TimedPulse, measureFraction: number) => void
   onVisit?: (visit: PathVisit) => void
+  onVisitEnd?: (visit: PathVisit) => void
   onStop?: (completed: boolean) => void
 }
 
@@ -22,13 +23,17 @@ export class Metronome {
   private rate = 1
   private onPulse?: (pulse: TimedPulse, measureFraction: number) => void
   private onVisit?: (visit: PathVisit) => void
+  private onVisitEnd?: (visit: PathVisit) => void
   private onStop?: (completed: boolean) => void
   private scheduledVisitKeys = new Set<string>()
+  private scheduledVisitEndKeys = new Set<string>()
+  private scheduledTimeouts: number[] = []
 
   constructor(options: MetronomeOptions) {
     this.audio = options.audio
     this.onPulse = options.onPulse
     this.onVisit = options.onVisit
+    this.onVisitEnd = options.onVisitEnd
     this.onStop = options.onStop
   }
 
@@ -58,6 +63,9 @@ export class Metronome {
     const firstPulse = this.pulses[this.nextPulseIndex]
     if (!firstPulse) return
     this.scheduledVisitKeys = new Set()
+    this.scheduledVisitEndKeys = new Set()
+    this.scheduledTimeouts.forEach((id) => clearTimeout(id))
+    this.scheduledTimeouts = []
     this.startAudioTime = this.audio.currentTime + 0.08
     this.startPerformanceTime = firstPulse.time
     this.timer = window.setInterval(() => this.schedule(), INTERVAL_MS)
@@ -73,6 +81,8 @@ export class Metronome {
       clearTimeout(this.stopTimer)
       this.stopTimer = null
     }
+    this.scheduledTimeouts.forEach((id) => clearTimeout(id))
+    this.scheduledTimeouts = []
     if (notify) this.onStop?.(completed)
   }
 
@@ -88,23 +98,40 @@ export class Metronome {
       const when = this.startAudioTime + ((pulse.time - this.startPerformanceTime) / this.rate)
       if (when > horizon) break
       this.scheduleClick(pulse, when)
-      const visit = this.visits.find((v) => v.visitKey === pulse.visitKey)
+      const visit = this.visits.find((v) => v.sequence === pulse.visitSequence)
       const scheduleKey = `${pulse.loopIndex ?? 0}:${pulse.visitKey}`
       if (visit && !this.scheduledVisitKeys.has(scheduleKey)) {
         const visitTime = this.startAudioTime + ((visit.startTime - this.startPerformanceTime) / this.rate)
         this.scheduledVisitKeys.add(scheduleKey)
-        window.setTimeout(() => this.onVisit?.(visit), Math.max(0, (visitTime - this.audio.currentTime) * 1000))
+        const visitDelay = Math.max(0, (visitTime - this.audio.currentTime) * 1000)
+        this.scheduledTimeouts.push(window.setTimeout(() => this.onVisit?.(visit), visitDelay))
+        const boundaryKey = String(visit.sequence)
+        if (this.onVisitEnd && !this.scheduledVisitEndKeys.has(boundaryKey)) {
+          const endTime = this.startAudioTime + ((visit.startTime + visit.durationSeconds - this.startPerformanceTime) / this.rate)
+          const endDelay = Math.max(0, (endTime - this.audio.currentTime) * 1000)
+          this.scheduledVisitEndKeys.add(boundaryKey)
+          this.scheduledTimeouts.push(
+            window.setTimeout(() => {
+              this.onVisitEnd?.(visit)
+              this.scheduledVisitEndKeys.delete(boundaryKey)
+            }, endDelay)
+          )
+        }
       }
       const fraction = visit && visit.durationQuarters > 0 ? pulse.measureQuarter / visit.durationQuarters : 0
       const visualDelay = Math.max(0, (when - this.audio.currentTime) * 1000)
-      window.setTimeout(() => this.onPulse?.(pulse, fraction), visualDelay)
+      this.scheduledTimeouts.push(window.setTimeout(() => this.onPulse?.(pulse, fraction), visualDelay))
       this.nextPulseIndex += 1
     }
     if (this.timer !== null && this.nextPulseIndex >= this.pulses.length) {
       clearInterval(this.timer)
       this.timer = null
-      const last = this.pulses[this.pulses.length - 1]
-      const endAt = this.startAudioTime + ((last.time - this.startPerformanceTime) / this.rate) + 0.3 / this.rate
+      const lastVisit = this.visits[this.visits.length - 1]
+      const lastPulse = this.pulses[this.pulses.length - 1]
+      const finalTime = lastVisit
+        ? lastVisit.startTime + lastVisit.durationSeconds
+        : lastPulse.time
+      const endAt = this.startAudioTime + ((finalTime - this.startPerformanceTime) / this.rate) + 0.1 / this.rate
       this.stopTimer = window.setTimeout(() => this.stop(true, true), Math.max(0, (endAt - this.audio.currentTime) * 1000))
     }
   }

@@ -288,3 +288,75 @@ test('共享段落路径变化：两个关联分部队列均待处理且逐项�
   await expect(queues.nth(1)).toContainText('待处理 1')
   await expect(queues.nth(1).getByTestId('queue-play')).toBeDisabled()
 })
+
+test('三项队列逐项完成、刷新恢复、完整播放后历史不重复', async ({ page }) => {
+  await installAudioProbe(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+
+  async function makeSegment(name: string, visitOption: number) {
+    await page.getByTestId('segment-name').fill(name)
+    await page.getByTestId('segment-start').selectOption({ index: visitOption })
+    await page.getByTestId('segment-end').selectOption({ index: visitOption })
+    await page.getByTestId('save-segment').click()
+  }
+  await makeSegment('短段一', 2)
+  await makeSegment('短段二', 3)
+  await makeSegment('短段三', 4)
+
+  await page.getByTestId('queue-name').fill('长笛')
+  await page.getByTestId('add-queue').click()
+  const queue = page.getByTestId('queue-card').first()
+  for (const name of ['短段一', '短段二', '短段三']) {
+    await queue.locator('select').last().selectOption({ label: name })
+    await queue.getByRole('button', { name: '加入' }).click()
+  }
+  await expect(queue.locator('.queue-items li')).toHaveCount(3)
+
+  await queue.getByTestId('queue-play').click()
+  await expect.poll(async () => {
+    const projects = (await readProjects(page)) as Array<{
+      plan?: { queues?: Array<{ completions: unknown[]; position?: { itemId: string; completed: boolean } }> }
+    }>
+    return projects.at(-1)?.plan?.queues?.[0]?.completions.length ?? 0
+  }, { timeout: 20_000 }).toBeGreaterThanOrEqual(2)
+  await page.getByRole('button', { name: '停止' }).click()
+  await expect(queue).toContainText('短段三')
+  const projectsAtInterrupt = (await readProjects(page)) as Array<{
+    plan?: { queues?: Array<{ completions: Array<{ segmentName: string }>; position?: { itemId: string } }> }
+  }>
+  const interruptedQueue = projectsAtInterrupt.at(-1)!.plan!.queues![0]
+  expect(interruptedQueue.completions.map((c) => c.segmentName)).toEqual(['短段一', '短段二'])
+
+  await page.reload()
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  const restoredQueue = page.getByTestId('queue-card').first()
+  await expect(restoredQueue).toContainText('短段三')
+  await restoredQueue.getByTestId('queue-play').click()
+  await expect(restoredQueue).toContainText('队列已完成')
+  const completedProjects = (await readProjects(page)) as Array<{
+    plan?: { queues?: Array<{ completions: Array<{ segmentName: string; loops: number; tempoScale: number }> }> }
+  }>
+  const completedQueue = completedProjects.at(-1)!.plan!.queues![0]
+  expect(completedQueue.completions.map((c) => c.segmentName)).toEqual(['短段一', '短段二', '短段三'])
+
+  await page.reload()
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  const reopenedQueue = page.getByTestId('queue-card').first()
+  await expect(reopenedQueue).toContainText('队列已完成')
+  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click())
+  const planFile = downloaded.bySuffix('rehearsal-plan.json')!
+  await page.evaluate(async (content) => {
+    const file = new File([content], 'plan.json', { type: 'application/json' })
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    const input = document.querySelector<HTMLInputElement>('input[data-testid="plan-file"]')!
+    input.files = dt.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }, planFile.content)
+  const reimportedProjects = (await readProjects(page)) as Array<{
+    plan?: { queues?: Array<{ completions: unknown[] }> }
+  }>
+  expect(reimportedProjects.at(-1)?.plan?.queues?.[0]?.completions).toHaveLength(3)
+})

@@ -130,7 +130,7 @@
               </select>
               <div class="row" style="margin-top:6px">
                 <button :disabled="!mismatchChoices[mismatch.id]" @click="resolveOne(mismatch.id, 'rebind', mismatchChoices[mismatch.id])">重新绑定</button>
-                <button @click="resolveOne(mismatch.id, 'historical')">保留历史</button>
+                <button v-if="mismatch.subject === 'queue-item'" @click="resolveOne(mismatch.id, 'historical')">保留历史</button>
                 <button class="danger" @click="resolveOne(mismatch.id, 'delete')">删除</button>
               </div>
             </div>
@@ -172,7 +172,8 @@
             <div class="muted">
               下一段：{{ queueSummary(queue).next?.segmentName ?? '无' }} ·
               已完成 {{ queueSummary(queue).completed }} ·
-              待处理 {{ queueSummary(queue).pending }}
+              待处理 {{ queueSummary(queue).blocked }} ·
+              <span v-if="queueSummary(queue).finished" class="badge ok">队列已完成</span>
             </div>
             <div class="row">
               <select v-model="queueItemSegmentId" :data-testid="`queue-segment-${queue.id}`" style="flex:1">
@@ -200,10 +201,10 @@
             <button
               class="primary"
               data-testid="queue-play"
-              :disabled="queueSummary(queue).pending > 0"
+              :disabled="queueSummary(queue).blocked > 0"
               @click="playQueue(queue)"
             >
-              按队列顺序恢复播放
+              {{ queuePositionText(queue).includes('已完成队列') ? '重新播放整个队列' : '按队列顺序恢复播放' }}
             </button>
             <div class="history-line">历史完成：{{ queue.completions.length ? queue.completions.slice(-3).map((c) => c.segmentName).join('、') : '无' }}</div>
           </div>
@@ -333,13 +334,14 @@ import {
 } from './planService'
 import {
   addQueueItem,
-  completeQueueItem,
+  advanceQueueItem,
   createQueue,
   createQueueItem,
   moveQueueItem as moveQueueItemInPlan,
   queueContentHash,
   queueSummary,
   removeQueueItem as removeQueueItemById,
+  startQueueRun,
   updateQueueProgress
 } from './queueService'
 import { buildQueuePlayback, buildSegmentPlayback } from './playback'
@@ -367,7 +369,13 @@ const selectedVisitSequence = ref<number | null>(null)
 const currentVisitKey = ref<string | null>(null)
 const currentPulse = shallowRef<TimedPulse | null>(null)
 const playing = ref(false)
-const activePlayback = shallowRef<{ queue?: PartQueue; itemId?: string; segment?: RehearsalSegment; session?: RehearsalSession } | null>(null)
+const activePlayback = shallowRef<{
+  queue?: PartQueue
+  itemId?: string
+  runId?: string
+  segment?: RehearsalSegment
+  session?: RehearsalSession
+} | null>(null)
 const activePosition = shallowRef<QueuePosition | SessionPosition | null>(null)
 const suppressNextPathReconcile = ref(false)
 const rate = ref(1)
@@ -757,21 +765,26 @@ async function removeQueueItem(queueId: string, itemId: string) {
 }
 
 function queuePositionText(queue: PartQueue): string {
+  if (queue.position?.completed || queue.completedAllAt) return '队列已完成'
   if (!queue.position) return '未开始'
   const item = queue.items.find((candidate) => candidate.id === queue.position?.itemId)
   if (!item) return '恢复位置失效'
-  return queue.position.completed
-    ? `${item.segmentName} 已完成`
-    : `${item.segmentName} · 循环${queue.position.loopIndex + 1} · 第${queue.position.measureQuarter + 1}拍`
+  return `${item.segmentName} · 循环${queue.position.loopIndex + 1} · 第${queue.position.measureQuarter + 1}拍`
 }
 
-async function playQueue(queue: PartQueue) {
-  if (!plan.value || queueSummary(queue).pending > 0) return
-  const playback = buildQueuePlayback(queue, path.value.visits, path.value.pulses, queue.position?.completed ? null : queue.position)
+async function playQueue(queue: PartQueue, restart = false) {
+  if (!plan.value) return
+  const summary = queueSummary(queue)
+  if (summary.blocked > 0 || summary.pending > 0) return
+  const resume = restart || queue.position?.completed ? null : queue.position
+  const playback = buildQueuePlayback(queue, path.value.visits, path.value.pulses, resume)
   if (!playback) return
+  const liveQueue = plan.value.queues.find((candidate) => candidate.id === queue.id) ?? queue
+  const runId = startQueueRun(liveQueue, restart)
+  await persistProject()
   const { context, metro } = ensureAudio()
   await context.resume()
-  activePlayback.value = { queue, itemId: playback.startPosition.itemId }
+  activePlayback.value = { queue: liveQueue, itemId: playback.startPosition.itemId, runId }
   currentVisitKey.value = playback.startPosition.visitKey
   metro.startCustom(playback.pulses, playback.visits, 1)
   playing.value = true
@@ -853,7 +866,8 @@ function ensureAudio(): { context: AudioContext; metro: Metronome } {
               loopIndex: pulse.loopIndex ?? 0,
               measureQuarter: pulse.measureQuarter,
               updatedAt: Date.now(),
-              completed: false
+              completed: false,
+              runId: activePlayback.value.runId
             }
           }
         } else if (activePlayback.value?.segment && activePlayback.value.session) {
@@ -874,17 +888,22 @@ function ensureAudio(): { context: AudioContext; metro: Metronome } {
           activePlayback.value.itemId = visit.queueItemId
         }
       },
+      onVisitEnd: (visit) => {
+        if (!activePlayback.value?.queue || !plan.value || !visit.queueItemEnd || !visit.queueItemId) return
+        const liveQueue = plan.value.queues.find((candidate) => candidate.id === activePlayback.value?.queue?.id)
+        if (liveQueue && visit.queueItemId) {
+          advanceQueueItem(plan.value, liveQueue.id, visit.queueItemId, activePlayback.value.runId)
+          void persistProject()
+        }
+      },
       onStop: async (completed) => {
         playing.value = false
         if (activePlayback.value?.queue && plan.value && activePosition.value && 'queueId' in activePosition.value) {
-          const queue = activePlayback.value.queue
-          const position = activePosition.value
-          if (completed) {
-            const lastQueueVisit = plan.value.currentSnapshot.visits.find((visit) => visit.visitKey === queue.items[queue.items.length - 1]?.end.visitKey)
-            void lastQueueVisit
-            completeQueueItem(plan.value, queue.id, position.itemId)
-          } else {
-            updateQueueProgress(plan.value, queue.id, position)
+          const queueId = activePlayback.value.queue.id
+          const liveQueue = plan.value.queues.find((candidate) => candidate.id === queueId)
+          if (!completed && liveQueue) {
+            const position = { ...activePosition.value, runId: activePlayback.value.runId }
+            updateQueueProgress(plan.value, liveQueue.id, position)
           }
           await persistProject()
         }

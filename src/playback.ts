@@ -20,8 +20,10 @@ export function buildSegmentPlayback(
   session: RehearsalSession,
   allVisits: PathVisit[],
   allPulses: TimedPulse[],
-  resume: SessionPosition | null
+  resume: SessionPosition | null,
+  queueItemId?: string
 ): SegmentPlayback | null {
+  void queueItemId
   const start = allVisits.find((visit) => visit.visitKey === segment.start.visitKey)
   const end = allVisits.find((visit) => visit.visitKey === segment.end.visitKey)
   if (!start || !end || start.sequence > end.sequence) return null
@@ -53,7 +55,14 @@ export function buildSegmentPlayback(
     for (let visitIndex = 0; visitIndex < sourceVisits.length; visitIndex += 1) {
       if (resumeInSegment && loopIndex === resumeLoop && visitIndex < resumeIndex) continue
       const source = sourceVisits[visitIndex]
-      const visit: PathVisit = { ...source, sequence: visits.length, startTime: cursor }
+      const visit: PathVisit = {
+        ...source,
+        durationQuarters: source.durationQuarters,
+        sequence: visits.length,
+        startTime: cursor,
+        queueItemId,
+        queueItemEnd: false
+      }
       visits.push(visit)
       const sourcePulses = sourcePulseByVisit.get(source.visitKey) ?? []
       for (const sourcePulse of sourcePulses) {
@@ -100,17 +109,19 @@ export function buildQueuePlayback(
   allPulses: TimedPulse[],
   resume: QueuePosition | null
 ): QueuePlayback | null {
-  const readyItems = queue.items.filter((item) => item.status === 'ready')
-  if (!readyItems.length) return null
-  const startIndex = resume ? readyItems.findIndex((item) => item.id === resume.itemId) : 0
+  const playableItems = queue.items.filter((item) => item.status === 'ready')
+  if (!playableItems.length || playableItems.length !== queue.items.length) return null
+  const resumeItemId = resume?.itemId
+  const startIndex = resume ? playableItems.findIndex((item) => item.id === resumeItemId) : 0
   const effectiveStart = startIndex < 0 ? 0 : startIndex
   const pulses: TimedPulse[] = []
   const visits: PathVisit[] = []
   let cursor = 0
+  let itemStart = 0
   let startPosition: QueuePosition | null = null
 
-  for (let itemOrder = effectiveStart; itemOrder < readyItems.length; itemOrder += 1) {
-    const item = readyItems[itemOrder]
+  for (let itemOrder = effectiveStart; itemOrder < playableItems.length; itemOrder += 1) {
+    const item = playableItems[itemOrder]
     const startVisit = allVisits.find((visit) => visit.visitKey === item.start.visitKey)
     const endVisit = allVisits.find((visit) => visit.visitKey === item.end.visitKey)
     if (!startVisit || !endVisit || startVisit.sequence > endVisit.sequence) return null
@@ -145,15 +156,16 @@ export function buildQueuePlayback(
           }
         : null
 
-    const playback = buildSegmentPlayback(segment, session, allVisits, allPulses, itemResume)
+    const playback = buildSegmentPlayback(segment, session, allVisits, allPulses, itemResume, item.id)
     if (!playback) return null
+    itemStart = cursor
 
     const offset = visits.length
     for (const visit of playback.visits) {
       visits.push({
         ...visit,
         sequence: visits.length,
-        startTime: cursor + visit.startTime / item.tempoScale,
+        startTime: itemStart + visit.startTime / item.tempoScale,
         durationSeconds: visit.durationSeconds / item.tempoScale,
         queueItemId: item.id,
         queueItemEnd: false
@@ -165,13 +177,16 @@ export function buildQueuePlayback(
         visitSequence: offset + pulse.visitSequence,
         loopIndex: pulse.loopIndex,
         queueItemId: item.id,
-        time: cursor + pulse.time / item.tempoScale,
+        time: itemStart + pulse.time / item.tempoScale,
         bpm: Math.round(pulse.bpm * item.tempoScale)
       })
     }
     const last = visits[visits.length - 1]
-    if (last) last.queueItemEnd = true
-    cursor += playback.totalSeconds / item.tempoScale
+    if (last) {
+      last.queueItemEnd = true
+      last.queueItemId = item.id
+    }
+    cursor = itemStart + playback.totalSeconds / item.tempoScale
 
     if (itemOrder === effectiveStart) {
       startPosition = {
