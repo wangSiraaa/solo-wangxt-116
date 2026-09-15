@@ -159,7 +159,56 @@
           </div>
           <button class="primary" data-testid="save-segment" :disabled="!canAddSegment" @click="addSegment">保存为可追溯版本</button>
 
-          <h3>段落实际序列与会话进度</h3>
+          <h3>分部队列</h3>
+          <div class="row">
+            <input v-model="newQueueName" data-testid="queue-name" placeholder="例如：第一小提琴" style="flex:1" />
+            <button data-testid="add-queue" :disabled="!newQueueName.trim()" @click="addNamedQueue">建立分部队列</button>
+          </div>
+          <div v-for="queue in queues" :key="queue.id" class="queue-card" data-testid="queue-card">
+            <div class="row between">
+              <b>{{ queue.name }}</b>
+              <span class="pill">内容 {{ shortHash(queueContentHash(queue)) }}</span>
+            </div>
+            <div class="muted">
+              下一段：{{ queueSummary(queue).next?.segmentName ?? '无' }} ·
+              已完成 {{ queueSummary(queue).completed }} ·
+              待处理 {{ queueSummary(queue).pending }}
+            </div>
+            <div class="row">
+              <select v-model="queueItemSegmentId" :data-testid="`queue-segment-${queue.id}`" style="flex:1">
+                <option value="">选择现有实际到达段落…</option>
+                <option v-for="segment in plan?.segments ?? []" :key="segment.id" :value="segment.id">{{ segment.name }}</option>
+              </select>
+              <input v-model.number="queueItemLoops" type="number" min="1" style="width:70px" title="循环数" aria-label="循环数" />
+              <input v-model.number="queueItemTempo" type="number" min="0.25" step="0.05" style="width:80px" title="速度倍率" aria-label="速度倍率" />
+              <button :disabled="!queueItemSegmentId" @click="addExistingSegmentToQueue(queue)">加入</button>
+            </div>
+            <ol class="queue-items">
+              <li v-for="(item, index) in queue.items" :key="item.id" :class="item.status" :data-testid="`queue-item-${item.id}`">
+                <b>{{ index + 1 }}. {{ item.segmentName }}</b>
+                ×{{ item.loops }} · ♩{{ Math.round(item.tempoScale * 100) }}%
+                <span v-if="item.status === 'pending'" class="badge error">待处理</span>
+                <span v-else-if="item.status === 'historical'" class="badge warning">历史</span>
+                <button @click="moveQueueItem(queue.id, item.id, -1)" :disabled="index === 0">↑</button>
+                <button @click="moveQueueItem(queue.id, item.id, 1)" :disabled="index === queue.items.length - 1">↓</button>
+                <button @click="removeQueueItem(queue.id, item.id)">移除</button>
+              </li>
+            </ol>
+            <div class="muted">
+              恢复：{{ queuePositionText(queue) }}
+            </div>
+            <button
+              class="primary"
+              data-testid="queue-play"
+              :disabled="queueSummary(queue).pending > 0"
+              @click="playQueue(queue)"
+            >
+              按队列顺序恢复播放
+            </button>
+            <div class="history-line">历史完成：{{ queue.completions.length ? queue.completions.slice(-3).map((c) => c.segmentName).join('、') : '无' }}</div>
+          </div>
+
+          <h3>段落实际序列与旧会话</h3>
           <div v-for="segment in plan?.segments ?? []" :key="segment.id" class="segment-card" :class="{ historical: segment.historical }" :data-testid="`segment-${segment.id}`">
             <div class="row between">
               <b>{{ segment.name }}</b>
@@ -186,7 +235,7 @@
                   <td><b>v{{ version.version }}</b></td>
                   <td>{{ version.changeSummary }}</td>
                   <td>{{ formatDate(version.createdAt) }}</td>
-                  <td>{{ version.segments.length }} 段 / {{ version.mismatches.length }} 失配</td>
+                  <td>{{ version.segments.length }} 段 / {{ (version.queues ?? []).length }} 队列 / {{ version.mismatches.length }} 失配</td>
                 </tr>
               </tbody>
             </table>
@@ -250,7 +299,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import type {
   PathVisit,
+  PartQueue,
   PlanMismatch,
+  QueuePosition,
   RehearsalMarker,
   RehearsalPlan,
   RehearsalSegment,
@@ -277,10 +328,21 @@ import {
   resolveMismatch,
   savePlanRevision,
   segmentVisits,
-  updateSegment,
-  updateSessionProgress
+  updateSessionProgress,
+  ensurePlanQueues
 } from './planService'
-import { buildSegmentPlayback } from './playback'
+import {
+  addQueueItem,
+  completeQueueItem,
+  createQueue,
+  createQueueItem,
+  moveQueueItem as moveQueueItemInPlan,
+  queueContentHash,
+  queueSummary,
+  removeQueueItem as removeQueueItemById,
+  updateQueueProgress
+} from './queueService'
+import { buildQueuePlayback, buildSegmentPlayback } from './playback'
 import { plainClone } from './plainClone'
 import { importPlanBundle, migrateLegacyProject, validateImportedPlan } from './projectMigration'
 
@@ -305,8 +367,8 @@ const selectedVisitSequence = ref<number | null>(null)
 const currentVisitKey = ref<string | null>(null)
 const currentPulse = shallowRef<TimedPulse | null>(null)
 const playing = ref(false)
-const activePlayback = shallowRef<{ segment?: RehearsalSegment; session?: RehearsalSession } | null>(null)
-const activePosition = shallowRef<SessionPosition | null>(null)
+const activePlayback = shallowRef<{ queue?: PartQueue; itemId?: string; segment?: RehearsalSegment; session?: RehearsalSession } | null>(null)
+const activePosition = shallowRef<QueuePosition | SessionPosition | null>(null)
 const suppressNextPathReconcile = ref(false)
 const rate = ref(1)
 const tab = ref<'measures' | 'path' | 'plan' | 'markers' | 'diagnostics'>('plan')
@@ -318,6 +380,10 @@ const newSegmentName = ref('')
 const newSegmentStartKey = ref('')
 const newSegmentEndKey = ref('')
 const newSegmentLoops = ref(2)
+const newQueueName = ref('')
+const queueItemSegmentId = ref('')
+const queueItemLoops = ref(1)
+const queueItemTempo = ref(1)
 const mismatchChoices = ref<Record<string, string>>({})
 
 const parsed = computed(() => (xml.value ? parseMusicXml(xml.value, currentFileName.value) : null))
@@ -332,13 +398,16 @@ const selectedVisit = computed(() =>
     ? selectedVisits.value[0] ?? null
     : path.value.visits.find((v) => v.sequence === selectedVisitSequence.value) ?? null
 )
+const queues = computed<PartQueue[]>(() => plan.value?.queues ?? [])
 const mismatches = computed(() => plan.value?.mismatches ?? [])
 const errorCount = computed(() => parsed.value?.diagnostics.filter((d) => d.level === 'error').length ?? 0)
 const levelText = { error: '错误', warning: '警告', info: '信息' } as const
 const subjectText: Record<PlanMismatch['subject'], string> = {
   'segment-start': '段落起点',
   'segment-end': '段落终点',
-  'session-position': '会话恢复位置'
+  'session-position': '会话恢复位置',
+  'queue-item': '分部队列段落',
+  'queue-position': '分部队列恢复位置'
 }
 const canPlayFullPath = computed(() => path.value.visits.length > 0 && !path.value.errors.length && !mismatches.value.length)
 const canAddSegment = computed(() =>
@@ -514,13 +583,14 @@ async function openProject(id: string) {
 
   if (stored.plan) {
     plan.value = plainClone(stored.plan)
+    if (await ensurePlanQueues(plan.value)) await persistProject()
   } else {
     const performancePath = buildPerformancePath(parseMusicXml(stored.xml, stored.fileName))
     const migrated = await createPlan('从旧标记工程迁移的默认方案', performancePath, xmlHash.value, {
       migratedFromLegacyMarkers: stored.markers.length > 0
     })
     plan.value = migrated
-    plan.value = plainClone(migrated)
+    plan.value = migrated
     const migratedProject = await migrateLegacyProject(
       plainClone({ ...stored, xmlSha256: xmlHash.value }),
       plainClone(migrated)
@@ -528,6 +598,7 @@ async function openProject(id: string) {
     project.value = migratedProject
     await saveProject(plainClone(migratedProject))
     projects.value = await listProjects()
+    await ensurePlanQueues(migrated)
   }
 }
 
@@ -649,6 +720,63 @@ async function addSegment() {
   await persistProject()
 }
 
+async function addNamedQueue() {
+  if (!plan.value || !newQueueName.value.trim()) return
+  createQueue(plan.value, newQueueName.value.trim())
+  newQueueName.value = ''
+  await appendVersion(plan.value, '建立具名分部队列', false)
+  await persistProject()
+}
+
+async function addExistingSegmentToQueue(queue: PartQueue) {
+  if (!plan.value || !queueItemSegmentId.value) return
+  const segment = plan.value.segments.find((candidate) => candidate.id === queueItemSegmentId.value)
+  if (!segment) return
+  const item = createQueueItem(segment, queueItemLoops.value, queueItemTempo.value)
+  addQueueItem(plan.value, queue.id, item)
+  queueItemSegmentId.value = ''
+  queueItemLoops.value = 1
+  queueItemTempo.value = 1
+  await appendVersion(plan.value, `向“${queue.name}”加入段落“${segment.name}”`, false)
+  await persistProject()
+}
+
+async function moveQueueItem(queueId: string, itemId: string, direction: -1 | 1) {
+  if (!plan.value) return
+  moveQueueItemInPlan(plan.value, queueId, itemId, direction)
+  const queue = plan.value.queues.find((candidate) => candidate.id === queueId)
+  await appendVersion(plan.value, `调整“${queue?.name ?? '分部'}”队列顺序`, false)
+  await persistProject()
+}
+
+async function removeQueueItem(queueId: string, itemId: string) {
+  if (!plan.value) return
+  removeQueueItemById(plan.value, queueId, itemId)
+  await appendVersion(plan.value, '从分部队列移除段落，其他分部历史保留', false)
+  await persistProject()
+}
+
+function queuePositionText(queue: PartQueue): string {
+  if (!queue.position) return '未开始'
+  const item = queue.items.find((candidate) => candidate.id === queue.position?.itemId)
+  if (!item) return '恢复位置失效'
+  return queue.position.completed
+    ? `${item.segmentName} 已完成`
+    : `${item.segmentName} · 循环${queue.position.loopIndex + 1} · 第${queue.position.measureQuarter + 1}拍`
+}
+
+async function playQueue(queue: PartQueue) {
+  if (!plan.value || queueSummary(queue).pending > 0) return
+  const playback = buildQueuePlayback(queue, path.value.visits, path.value.pulses, queue.position?.completed ? null : queue.position)
+  if (!playback) return
+  const { context, metro } = ensureAudio()
+  await context.resume()
+  activePlayback.value = { queue, itemId: playback.startPosition.itemId }
+  currentVisitKey.value = playback.startPosition.visitKey
+  metro.startCustom(playback.pulses, playback.visits, 1)
+  playing.value = true
+}
+
 function sessionsForSegment(segmentId: string): RehearsalSession[] {
   return plan.value?.sessions.filter((session) => session.segmentIds.includes(segmentId)) ?? []
 }
@@ -713,7 +841,22 @@ function ensureAudio(): { context: AudioContext; metro: Metronome } {
         currentPulse.value = pulse
         currentVisitKey.value = pulse.visitKey
         display.value?.showMeasure(pulse.writtenMeasure, fraction)
-        if (activePlayback.value?.segment && activePlayback.value.session) {
+        if (activePlayback.value?.queue) {
+          const queue = activePlayback.value.queue
+          const item = queue.items.find((candidate) => candidate.id === pulse.queueItemId || candidate.id === activePlayback.value?.itemId)
+          if (item) {
+            activePosition.value = {
+              queueId: queue.id,
+              itemId: item.id,
+              segmentId: item.segmentId,
+              visitKey: pulse.visitKey,
+              loopIndex: pulse.loopIndex ?? 0,
+              measureQuarter: pulse.measureQuarter,
+              updatedAt: Date.now(),
+              completed: false
+            }
+          }
+        } else if (activePlayback.value?.segment && activePlayback.value.session) {
           activePosition.value = {
             segmentId: activePlayback.value.segment.id,
             visitKey: pulse.visitKey,
@@ -727,9 +870,24 @@ function ensureAudio(): { context: AudioContext; metro: Metronome } {
       onVisit: (visit) => {
         currentVisitKey.value = visit.visitKey
         display.value?.showMeasure(visit.writtenMeasure, 0)
+        if (activePlayback.value?.queue && visit.queueItemId) {
+          activePlayback.value.itemId = visit.queueItemId
+        }
       },
       onStop: async (completed) => {
         playing.value = false
+        if (activePlayback.value?.queue && plan.value && activePosition.value && 'queueId' in activePosition.value) {
+          const queue = activePlayback.value.queue
+          const position = activePosition.value
+          if (completed) {
+            const lastQueueVisit = plan.value.currentSnapshot.visits.find((visit) => visit.visitKey === queue.items[queue.items.length - 1]?.end.visitKey)
+            void lastQueueVisit
+            completeQueueItem(plan.value, queue.id, position.itemId)
+          } else {
+            updateQueueProgress(plan.value, queue.id, position)
+          }
+          await persistProject()
+        }
         if (activePlayback.value?.segment && activePlayback.value.session && plan.value) {
           const { segment, session } = activePlayback.value
           const position: SessionPosition | null = completed
@@ -795,5 +953,4 @@ function formatTime(seconds: number): string {
 
 // Keep the import referenced so tree-shaking preserves savePlanRevision in future manual re-snapshot flows.
 void savePlanRevision
-void updateSegment
 </script>

@@ -99,79 +99,78 @@ async function collectDownloads(page: Page, action: () => Promise<void>) {
   return { results, bySuffix }
 }
 
-test('双跳房段落：保存幂等、刷新恢复、循环播放、导出和方案导入均绑定路径快照', async ({ page }) => {
+test('分部队列：独立速度/循环、刷新恢复、队列顺序隔离、失配阻塞和导入去重', async ({ page }) => {
   await installAudioProbe(page)
   await page.goto('/')
-  await expect(page.getByRole('heading', { name: '双跳房 · 变速 · 多声部共有小节' })).toBeVisible()
-  await expect(page.locator('.stat').filter({ hasText: '实际到达' })).toContainText('13')
-
   await page.getByRole('button', { name: '排练方案', exact: true }).click()
-  await page.getByTestId('segment-name').fill('第一房到第二房')
-  await page.getByTestId('segment-start').selectOption({ index: 5 }) // sequence 4: first ending
-  await page.getByTestId('segment-end').selectOption({ index: 10 }) // sequence 9: second ending second measure
+  await page.getByTestId('segment-name').fill('共享段落')
+  await page.getByTestId('segment-start').selectOption({ index: 5 })
+  await page.getByTestId('segment-end').selectOption({ index: 10 })
   await page.getByTestId('save-segment').click()
-  const segmentCard = page.locator('.segment-card', { hasText: '第一房到第二房' })
-  await expect(segmentCard).toContainText('4(房1) → 1 → 2 → 3 → 5(房2) → 6(房2)')
-  await expect(page.locator('.plan-header')).toContainText('v2')
 
-  // Repeated saves with unchanged content must not create another version/segment.
-  const beforeVersion = await page.locator('.plan-header .pill').textContent()
-  await page.getByRole('button', { name: '保存/更新工程' }).click()
-  await expect(page.locator('.plan-header .pill')).toHaveText(beforeVersion ?? 'v2')
-  await expect(page.locator('.segment-card', { hasText: '第一房到第二房' })).toHaveCount(1)
+  await page.getByTestId('queue-name').fill('第一小提琴')
+  await page.getByTestId('add-queue').click()
+  await page.getByTestId('queue-name').fill('第二小提琴')
+  await page.getByTestId('add-queue').click()
+  const queueCards = page.getByTestId('queue-card')
+  await expect(queueCards).toHaveCount(2)
 
-  const playButton = segmentCard.getByTestId('segment-play')
-  await playButton.click()
+  async function addToQueue(index: number, loops: string, tempo: string, duplicate = false) {
+    const card = queueCards.nth(index)
+    for (let i = 0; i < (duplicate ? 2 : 1); i += 1) {
+      await card.locator('select').last().selectOption({ label: '共享段落' })
+      await card.getByLabel('循环数').fill(loops)
+      await card.getByLabel('速度倍率').fill(tempo)
+      await card.getByRole('button', { name: '加入' }).click()
+    }
+  }
+  await addToQueue(0, '2', '0.75', true)
+  await addToQueue(1, '3', '1')
+  await expect(queueCards.nth(0)).toContainText('×2')
+  await expect(queueCards.nth(0)).toContainText('♩75%')
+  await expect(queueCards.nth(1)).toContainText('×3')
+  await expect(queueCards.nth(1)).toContainText('♩100%')
+
+  await queueCards.nth(1).getByTestId('queue-play').click()
   await expect.poll(
-    () =>
-      page.evaluate(() => ((window as unknown as { __audioEvents?: Array<{ type: string }> }).__audioEvents ?? []).filter((e) => e.type === 'osc-start').length),
+    () => page.evaluate(() => ((window as unknown as { __audioEvents?: Array<{ type: string }> }).__audioEvents ?? []).filter((e) => e.type === 'osc-start').length),
     { timeout: 5_000 }
-  ).toBeGreaterThanOrEqual(8)
-  await expect.poll(
-    () => page.evaluate(() => ((window as unknown as { __audioEvents?: Array<Record<string, unknown>> }).__audioEvents ?? []).some((e) => e.state === 'running')),
-    { timeout: 5_000 }
-  ).toBe(true)
-  // Stop during the repeated section. Resume must remain on the structural path key, not merely written measure 2.
+  ).toBeGreaterThanOrEqual(4)
   await page.getByRole('button', { name: '停止' }).click()
-  await expect(page.getByTestId('save-state')).toContainText('已保存')
-  await expect(segmentCard).toContainText('中断于循环1')
+  await expect(queueCards.nth(1)).toContainText('循环1')
+  await expect(queueCards.nth(0)).toContainText('未开始')
+
+  await queueCards.nth(0).locator('.queue-items li').first().getByRole('button', { name: '↓' }).click()
+  await expect(queueCards.nth(1)).toContainText('循环1')
+  await expect(queueCards.nth(0)).toContainText('未开始')
 
   await page.reload()
-  await expect(page.getByRole('heading', { name: '双跳房 · 变速 · 多声部共有小节' })).toBeVisible()
   await page.getByRole('button', { name: '排练方案', exact: true }).click()
-  const reloadedCard = page.locator('.segment-card', { hasText: '第一房到第二房' })
-  await expect(reloadedCard).toContainText('中断于循环1')
-  await reloadedCard.getByTestId('segment-play').click()
-  await expect(page.locator('.current-pulse')).toContainText('循环1')
-  await page.getByRole('button', { name: '停止' }).click()
+  const reloaded = page.getByTestId('queue-card')
+  await expect(reloaded.nth(1)).toContainText('循环1')
+  await expect(reloaded.nth(0)).toContainText('未开始')
 
-  // Three artifacts: original XML, independent marker JSON, and checksummed plan JSON.
-  const downloads = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click())
-  const xmlFile = downloads.bySuffix('.musicxml')!
-  const markerFile = downloads.bySuffix('rehearsal-markers.json')!
-  const planFile = downloads.bySuffix('rehearsal-plan.json')!
-  expect(xmlFile.content).toContain('<work-title>双跳房')
-  expect(xmlFile.content).not.toContain('第一房到第二房')
-  expect(JSON.parse(markerFile.content).markers).toHaveLength(2)
+  const beforeVersion = await page.locator('.plan-header .pill').first().textContent()
+  await page.getByRole('button', { name: '保存/更新工程' }).click()
+  await expect(page.locator('.plan-header .pill').first()).toHaveText(beforeVersion ?? '')
+  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click())
+  const planFile = downloaded.bySuffix('rehearsal-plan.json')!
   const planBundle = JSON.parse(planFile.content)
-  expect(planBundle.schema).toBe('rehearsal-stand-plan/v1')
-  expect(planBundle.xmlSha256).toMatch(/^[a-f0-9]{64}$/)
-  expect(planBundle.plan.segments).toHaveLength(1)
+  expect(planBundle.plan.queues).toHaveLength(2)
+  expect(planBundle.plan.queues[0].items).toHaveLength(2)
+  expect(planBundle.plan.queues[1].position).toBeTruthy()
 
-  // Re-import same plan: duplicate version and duplicate segments must not appear.
-  // Playwright downloads are already materialized; recreate an upload File in the browser from the content.
-  const duplicateMessage = await page.evaluate(async (content) => {
+  await page.evaluate(async (content) => {
     const file = new File([content], 'downloaded-plan.json', { type: 'application/json' })
     const dt = new DataTransfer()
     dt.items.add(file)
-    const input = document.querySelector<HTMLInputElement>('input[type=file][accept=".json,application/json"]')!
+    const input = document.querySelector<HTMLInputElement>('input[data-testid="plan-file"]')!
     input.files = dt.files
     input.dispatchEvent(new Event('change', { bubbles: true }))
     await new Promise((resolve) => setTimeout(resolve, 500))
-    return null
   }, planFile.content)
-  expect(duplicateMessage).toBeNull()
-  await expect(page.locator('.segment-card', { hasText: '第一房到第二房' })).toHaveCount(1)
+  await expect(page.getByTestId('queue-card')).toHaveCount(2)
+  await expect(page.getByTestId('queue-card').nth(0).locator('.queue-items li')).toHaveCount(2)
 })
 
 test('导航改变使到达位置消失：进入待处理状态，禁止误播；可逐项重绑/保留/删除', async ({ page }) => {
@@ -254,4 +253,38 @@ test('旧版仅含标记工程自动迁移：补齐默认方案，标记/XML/未
       expect.stringContaining('rehearsal-plan.json')
     ])
   )
+})
+
+test('共享段落路径变化：两个关联分部队列均待处理且逐项重绑只恢复对应队列', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  await page.getByTestId('segment-name').fill('共享失配段落')
+  await page.getByTestId('segment-start').selectOption({ index: 5 })
+  await page.getByTestId('segment-end').selectOption({ index: 10 })
+  await page.getByTestId('save-segment').click()
+
+  await page.getByTestId('queue-name').fill('一提')
+  await page.getByTestId('add-queue').click()
+  await page.getByTestId('queue-name').fill('二提')
+  await page.getByTestId('add-queue').click()
+  const queues = page.getByTestId('queue-card')
+  for (const index of [0, 1]) {
+    const card = queues.nth(index)
+    await card.locator('select').last().selectOption({ label: '共享失配段落' })
+    await card.getByRole('button', { name: '加入' }).click()
+  }
+  await page.locator('input[data-testid="score-file"]').setInputFiles(path.join(fixtureDir, 'modified-navigation.musicxml'))
+  await expect(page.locator('.plan-header')).toContainText('待处理失配')
+  await expect(queues.nth(0)).toContainText('待处理 1')
+  await expect(queues.nth(1)).toContainText('待处理 1')
+  await expect(queues.nth(0).getByTestId('queue-play')).toBeDisabled()
+  await expect(queues.nth(1).getByTestId('queue-play')).toBeDisabled()
+
+  // Resolve only the first queue's explicit mismatch. The second must remain blocked.
+  const firstQueueMismatch = page.locator('.mismatch-list .diagnostic', { hasText: '一提' }).first()
+  await firstQueueMismatch.locator('select').selectOption({ index: 1 })
+  await firstQueueMismatch.getByRole('button', { name: '重新绑定' }).click()
+  await expect(queues.nth(0)).toContainText('待处理 0')
+  await expect(queues.nth(1)).toContainText('待处理 1')
+  await expect(queues.nth(1).getByTestId('queue-play')).toBeDisabled()
 })

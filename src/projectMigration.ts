@@ -1,5 +1,7 @@
-import type { PlanExportBundle, RehearsalPlan, StoredProject } from './types'
+import type { PartQueue, PlanExportBundle, RehearsalPlan, StoredProject } from './types'
 import { canonicalJson, sha256Text } from './crypto'
+import { fullQueueHash, queueContentHash } from './queueService'
+import { plainClone } from './plainClone'
 
 type PlanImportShape = PlanExportBundle
 
@@ -71,7 +73,31 @@ export async function importPlanBundle(
 
   const incomingVersion = bundle.plan.versions[0]?.version ?? 1
   const localVersion = localPlan.versions[0]?.version ?? 1
-  if (incomingVersion <= localVersion && localPlan.pathChecksum === bundle.plan.pathChecksum) {
+
+  const incomingQueues: PartQueue[] = Array.isArray(bundle.plan.queues) ? bundle.plan.queues : []
+  const localQueues: PartQueue[] = Array.isArray(localPlan.queues) ? localPlan.queues : []
+  const localByContent = new Map(localQueues.map((queue) => [queueContentHash(queue), queue]))
+  let addedQueues = 0
+  const mergedQueues = localQueues.map((queue) => plainClone(queue))
+  for (const incomingQueue of incomingQueues) {
+    const contentHash = queueContentHash(incomingQueue)
+    const existing = localByContent.get(contentHash)
+    if (!existing) {
+      mergedQueues.push(plainClone(incomingQueue))
+      addedQueues += 1
+      continue
+    }
+    const localUpdated = new Date(existing.updatedAt).getTime()
+    const incomingUpdated = new Date(incomingQueue.updatedAt).getTime()
+    if (localUpdated > incomingUpdated) {
+      return { status: 'newer-local', message: `本部分队“${existing.name}”比导入文件更新，已避免覆盖。` }
+    }
+    if (fullQueueHash(existing) === fullQueueHash(incomingQueue)) continue
+    const index = mergedQueues.findIndex((queue) => queue.id === existing.id)
+    if (index >= 0) mergedQueues[index] = plainClone(incomingQueue)
+  }
+
+  if (!addedQueues && incomingVersion <= localVersion && localPlan.pathChecksum === bundle.plan.pathChecksum) {
     const incomingHash = bundle.plan.versions[0]?.contentHash
     const localHash = localPlan.versions[0]?.contentHash
     if (incomingHash === localHash || localPlan.versions.some((version) => version.contentHash === incomingHash)) {
@@ -82,10 +108,15 @@ export async function importPlanBundle(
     return { status: 'newer-local', message: '本地方案比导入文件更新，已避免覆盖。' }
   }
 
+  const mergedPlan: RehearsalPlan = {
+    ...plainClone(bundle.plan),
+    queues: mergedQueues
+  }
+
   return {
-    project: { ...local, schemaVersion: 2, plan: bundle.plan, updatedAt: bundle.exportedAt },
+    project: { ...local, schemaVersion: 2, plan: mergedPlan, updatedAt: bundle.exportedAt },
     status: 'imported',
-    message: '已导入方案版本。'
+    message: addedQueues ? `已导入 ${addedQueues} 个新分部队列。` : '已合并方案队列。'
   }
 }
 

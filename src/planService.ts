@@ -1,6 +1,15 @@
 import { canonicalJson, sha256Json, sha256Text } from './crypto'
 import { createId } from './db'
 import { plainClone } from './plainClone'
+import {
+  ensureQueues,
+  markQueueItemHistorical,
+  markQueueMismatches,
+  migrateSessionsToDefaultQueue,
+  rebindQueueItem,
+  removeQueueMismatchItem,
+  validateQueuesAfterSegmentChange
+} from './queueService'
 import type {
   PathSnapshotVisit,
   PathVisit,
@@ -66,6 +75,7 @@ export async function createPlan(
     currentSnapshot: snapshot,
     segments: [],
     sessions: [],
+    queues: [],
     mismatches: [],
     versions: [],
     createdAt: now,
@@ -109,6 +119,7 @@ export function addSegment(
   plan.updatedAt = now
   const session = createSession(`会话：${name}`, [segment.id], Object.fromEntries([[segment.id, segment.loops]]))
   plan.sessions.push(session)
+  if (!Array.isArray(plan.queues)) plan.queues = []
   return segment
 }
 
@@ -128,6 +139,7 @@ export function deleteSegment(plan: RehearsalPlan, segmentId: string) {
     if (session.position?.segmentId === segmentId) session.position = null
   }
   plan.mismatches = plan.mismatches.filter((mismatch) => mismatch.segmentId !== segmentId)
+  validateQueuesAfterSegmentChange(plan)
   plan.updatedAt = Date.now()
 }
 
@@ -174,6 +186,7 @@ export async function reconcilePlan(
   }
 
   const next: RehearsalPlan = plainClone(previous)
+  ensureQueues(next)
   next.currentSnapshot = snapshot
   next.xmlSha256 = xmlSha256
   next.pathChecksum = snapshot.pathChecksum
@@ -232,6 +245,18 @@ export async function reconcilePlan(
     if (endpoint) checkEndpoint(endpoint, 'session-position', next.segments.find((segment) => segment.id === session.position?.segmentId), session)
   }
 
+  markQueueMismatches(
+    next,
+    previous.xmlSha256,
+    (visitKey) => currentByKey.has(visitKey),
+    (endpoint) => currentByKey.get(endpoint.visitKey)?.structuralSignature === endpoint.structuralSignature,
+    (endpoint) => {
+      const sameMeasure = snapshot.visits.filter((visit) => visit.writtenMeasure === endpoint.writtenMeasure)
+      return (sameMeasure.length ? sameMeasure : snapshot.visits).map((visit) => endpointFromVisit(visit))
+    }
+  )
+  validateQueuesAfterSegmentChange(next)
+
   next.status = next.mismatches.length ? 'pending-mismatch' : 'ready'
   const changed = await appendVersion(next, previous.xmlSha256 === xmlSha256 ? '导航路径变更后重新校验方案' : '乐谱内容变更后重新校验方案', true)
   return { plan: next, changed: true, newVersion: changed }
@@ -252,8 +277,33 @@ export async function resolveMismatch(
   action: 'rebind' | 'historical' | 'delete',
   chosenVisitKey?: string
 ): Promise<boolean> {
+  ensureQueues(plan)
   const mismatch = plan.mismatches.find((item) => item.id === mismatchId)
   if (!mismatch) return false
+
+  if (mismatch.subject === 'queue-item') {
+    const chosen = chosenVisitKey ? plan.currentSnapshot.visits.find((visit) => visit.visitKey === chosenVisitKey) : null
+    const endpoint = chosen ? endpointFromVisit(chosen) : null
+    if (action === 'rebind' && endpoint) {
+      rebindQueueItem(
+        plan,
+        mismatchId,
+        mismatch.endpointSide === 'start' ? endpoint : null,
+        mismatch.endpointSide === 'end' ? endpoint : null
+      )
+    } else if (action === 'historical') {
+      markQueueItemHistorical(plan, mismatchId)
+    } else if (action === 'delete') {
+      removeQueueMismatchItem(plan, mismatchId)
+    }
+    plan.status = plan.mismatches.length ? 'pending-mismatch' : 'ready'
+    return appendVersion(
+      plan,
+      action === 'rebind' ? '逐项重新绑定分部队列到达位置' : action === 'historical' ? '保留分部队列为历史' : '删除失配队列项',
+      false
+    )
+  }
+
   const chosen = chosenVisitKey ? plan.currentSnapshot.visits.find((visit) => visit.visitKey === chosenVisitKey) : null
 
   if (action === 'rebind' && chosen) {
@@ -301,6 +351,17 @@ export async function resolveMismatch(
   )
 }
 
+export async function ensurePlanQueues(plan: RehearsalPlan, changeSummary = '迁移单会话方案为默认分部队列'): Promise<boolean> {
+  ensureQueues(plan)
+  const migrated = migrateSessionsToDefaultQueue(plan)
+  if (migrated && migrated.items.length) {
+    return appendVersion(plan, changeSummary, false)
+  }
+  return false
+}
+
+export { validateQueuesAfterSegmentChange }
+
 export async function appendVersion(plan: RehearsalPlan, changeSummary: string, force: boolean): Promise<boolean> {
   const contentHash = await versionContentHash(plan)
   if (!force && plan.versions[0]?.contentHash === contentHash) return false
@@ -314,6 +375,7 @@ export async function appendVersion(plan: RehearsalPlan, changeSummary: string, 
     pathChecksum: plan.pathChecksum,
     segments: plainClone(plan.segments),
     sessions: plainClone(plan.sessions),
+    queues: plainClone(plan.queues ?? []),
     mismatches: plainClone(plan.mismatches)
   }
   plan.versions.unshift(version)
@@ -339,6 +401,26 @@ async function versionContentHash(plan: RehearsalPlan): Promise<string> {
       segmentIds: session.segmentIds,
       segmentLoops: session.segmentLoops,
       position: session.position
+    })),
+    queues: (plan.queues ?? []).map((queue) => ({
+      id: queue.id,
+      name: queue.name,
+      items: queue.items.map((item) => ({
+        id: item.id,
+        segmentId: item.segmentId,
+        start: item.start.visitKey,
+        end: item.end.visitKey,
+        loops: item.loops,
+        tempoScale: item.tempoScale,
+        status: item.status
+      })),
+      position: queue.position,
+      completions: queue.completions.map((completion) => ({
+        itemId: completion.itemId,
+        segmentId: completion.segmentId,
+        completedAt: completion.completedAt
+      })),
+      updatedAt: queue.updatedAt
     })),
     mismatches: plan.mismatches.map((mismatch) => ({
       id: mismatch.id,

@@ -1,5 +1,7 @@
 import type {
+  PartQueue,
   PathVisit,
+  QueuePosition,
   RehearsalSegment,
   RehearsalSession,
   SessionPosition,
@@ -83,4 +85,108 @@ export function buildSegmentPlayback(
       completed: false
     }
   }
+}
+
+export interface QueuePlayback {
+  pulses: TimedPulse[]
+  visits: PathVisit[]
+  totalSeconds: number
+  startPosition: QueuePosition
+}
+
+export function buildQueuePlayback(
+  queue: PartQueue,
+  allVisits: PathVisit[],
+  allPulses: TimedPulse[],
+  resume: QueuePosition | null
+): QueuePlayback | null {
+  const readyItems = queue.items.filter((item) => item.status === 'ready')
+  if (!readyItems.length) return null
+  const startIndex = resume ? readyItems.findIndex((item) => item.id === resume.itemId) : 0
+  const effectiveStart = startIndex < 0 ? 0 : startIndex
+  const pulses: TimedPulse[] = []
+  const visits: PathVisit[] = []
+  let cursor = 0
+  let startPosition: QueuePosition | null = null
+
+  for (let itemOrder = effectiveStart; itemOrder < readyItems.length; itemOrder += 1) {
+    const item = readyItems[itemOrder]
+    const startVisit = allVisits.find((visit) => visit.visitKey === item.start.visitKey)
+    const endVisit = allVisits.find((visit) => visit.visitKey === item.end.visitKey)
+    if (!startVisit || !endVisit || startVisit.sequence > endVisit.sequence) return null
+
+    const segment: RehearsalSegment = {
+      id: item.segmentId,
+      name: item.segmentName,
+      start: item.start,
+      end: item.end,
+      loops: item.loops,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt
+    }
+    const session: RehearsalSession = {
+      id: queue.id,
+      name: queue.name,
+      segmentIds: [segment.id],
+      segmentLoops: { [segment.id]: item.loops },
+      position: null,
+      createdAt: queue.createdAt,
+      updatedAt: queue.updatedAt
+    }
+    const itemResume =
+      resume && itemOrder === effectiveStart && resume.itemId === item.id
+        ? {
+            segmentId: item.segmentId,
+            visitKey: resume.visitKey,
+            loopIndex: resume.loopIndex,
+            measureQuarter: resume.measureQuarter,
+            updatedAt: resume.updatedAt,
+            completed: false
+          }
+        : null
+
+    const playback = buildSegmentPlayback(segment, session, allVisits, allPulses, itemResume)
+    if (!playback) return null
+
+    const offset = visits.length
+    for (const visit of playback.visits) {
+      visits.push({
+        ...visit,
+        sequence: visits.length,
+        startTime: cursor + visit.startTime / item.tempoScale,
+        durationSeconds: visit.durationSeconds / item.tempoScale,
+        queueItemId: item.id,
+        queueItemEnd: false
+      })
+    }
+    for (const pulse of playback.pulses) {
+      pulses.push({
+        ...pulse,
+        visitSequence: offset + pulse.visitSequence,
+        loopIndex: pulse.loopIndex,
+        queueItemId: item.id,
+        time: cursor + pulse.time / item.tempoScale,
+        bpm: Math.round(pulse.bpm * item.tempoScale)
+      })
+    }
+    const last = visits[visits.length - 1]
+    if (last) last.queueItemEnd = true
+    cursor += playback.totalSeconds / item.tempoScale
+
+    if (itemOrder === effectiveStart) {
+      startPosition = {
+        queueId: queue.id,
+        itemId: item.id,
+        segmentId: item.segmentId,
+        visitKey: itemResume?.visitKey ?? item.start.visitKey,
+        loopIndex: itemResume?.loopIndex ?? 0,
+        measureQuarter: itemResume?.measureQuarter ?? 0,
+        updatedAt: Date.now(),
+        completed: false
+      }
+    }
+  }
+
+  if (!startPosition) return null
+  return { pulses, visits, totalSeconds: cursor, startPosition }
 }

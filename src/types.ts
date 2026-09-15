@@ -135,6 +135,8 @@ export interface PathVisit {
   endingNumber: number | null
   action: string
   actionKind: PathActionKind
+  queueItemId?: string
+  queueItemEnd?: boolean
   /** Content signature independent of the visit's current ordinal in the complete performance path. */
   structuralSignature: string
 }
@@ -143,6 +145,7 @@ export interface TimedPulse {
   visitSequence: number
   visitKey: string
   loopIndex?: number
+  queueItemId?: string
   writtenMeasure: number
   printedNumber: string
   measureQuarter: number
@@ -232,8 +235,55 @@ export interface RehearsalSession {
   updatedAt: number
 }
 
+export interface QueuePosition {
+  queueId: string
+  itemId: string
+  segmentId: string
+  visitKey: string
+  loopIndex: number
+  measureQuarter: number
+  updatedAt: number
+  completed: boolean
+}
+
+export interface QueueCompletion {
+  id: string
+  itemId: string
+  segmentId: string
+  segmentName: string
+  loops: number
+  tempoScale: number
+  completedAt: number
+}
+
+export interface PartQueueItem {
+  id: string
+  segmentId: string
+  segmentName: string
+  start: SegmentEndpoint
+  end: SegmentEndpoint
+  loops: number
+  /** Multiplier applied to the score's notated tempo: 0.5 = half speed, 1.25 = faster. */
+  tempoScale: number
+  status: 'ready' | 'pending' | 'historical'
+  note?: string
+  removedSegment?: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export interface PartQueue {
+  id: string
+  name: string
+  items: PartQueueItem[]
+  position: QueuePosition | null
+  completions: QueueCompletion[]
+  createdAt: number
+  updatedAt: number
+}
+
 export type PlanMismatchKind = 'score-content' | 'missing-visit' | 'structural-signature'
-export type PlanMismatchSubject = 'segment-start' | 'segment-end' | 'session-position'
+export type PlanMismatchSubject = 'segment-start' | 'segment-end' | 'session-position' | 'queue-item' | 'queue-position'
 
 export interface PlanMismatch {
   id: string
@@ -241,6 +291,9 @@ export interface PlanMismatch {
   subject: PlanMismatchSubject
   segmentId?: string
   sessionId?: string
+  queueId?: string
+  itemId?: string
+  endpointSide?: 'start' | 'end'
   expected: SegmentEndpoint | (SessionPosition & { writtenMeasure?: number; printedNumber?: string })
   candidates: SegmentEndpoint[]
   message: string
@@ -258,6 +311,7 @@ export interface RehearsalPlanVersion {
   pathChecksum: string
   segments: RehearsalSegment[]
   sessions: RehearsalSession[]
+  queues: PartQueue[]
   mismatches: PlanMismatch[]
 }
 
@@ -270,6 +324,7 @@ export interface RehearsalPlan {
   currentSnapshot: RehearsalPathSnapshot
   segments: RehearsalSegment[]
   sessions: RehearsalSession[]
+  queues: PartQueue[]
   mismatches: PlanMismatch[]
   versions: RehearsalPlanVersion[]
   createdAt: number
