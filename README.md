@@ -14,7 +14,17 @@ npm run dev
 ```bash
 npm run build
 npm test
+npm run test:e2e
 ```
+
+E2E 使用 Playwright 的真实 Chromium；测试会自动执行生产构建并启动 preview。首次运行先安装浏览器：
+
+```bash
+npx playwright install chromium
+npm run test:e2e
+```
+
+若系统缺少浏览器动态库，使用 `npx playwright install --with-deps chromium`；无 root 环境可下载依赖包到本地后用 `LD_LIBRARY_PATH` 指向解压目录。
 
 ## 演奏路径原则
 
@@ -27,7 +37,7 @@ npm test
 - `<sound tempo="...">` 和 `<metronome><per-minute>` 速度；
 - `<time>` 拍号、`<divisions>` 和真实 `<duration>`，首个短小节按弱起处理。
 
-若 Segno/Coda/Fine 缺失、跳房没有闭合、后反复无匹配起点、目标重复执行形成无限循环等，诊断面板和播放按钮会显示错误，不猜测跳转。无法识别但看起来像导航的文字、未参与路径构造的小节线元素会列警告，不会静默丢弃。
+若 Segno/Coda/Fine 缺失、跳房没有闭合、后反复无匹配起点、目标重复执行形成无限循环等，诊断面板和播放按钮会显示错误，不猜测跳转。无法识别但看起来像导航的文字、未参与路径构造的小节线元素，以及 `measure` / `note` / `attributes` / `direction` 中的未知直接 MusicXML 子结构会列 `UNKNOWN_XML_STRUCTURE` 警告，不会静默丢弃。警告不会阻止进入该书面小节：路径仍按已知 `<duration>` 和拍号计算，但明确提示该符号的演奏/跳转语义未被解释，原 XML 也保持不变。
 
 ## 示例
 
@@ -47,7 +57,13 @@ Web Audio 使用提前调度的振荡器生成节拍音，避免用 UI 定时器
 ## 数据与导出
 
 - IndexedDB 数据库：`rehearsal-stand`，store：`projects`；
-- 保存内容包含原始 MusicXML 字符串和独立 `RehearsalMarker[]`；
-- 导出两个文件：
+- 保存内容包含原始 MusicXML 字符串、独立 `RehearsalMarker[]` 和可恢复排练方案；
+- 旧的仅含 markers 的 v1 工程首次打开时自动迁移到 v2，原标记和 XML 不改变；
+- 方案包含命名段落、会话、循环次数、中断位置、路径快照、XML SHA-256、路径 checksum 和可追溯版本；
+- 路径重新计算时按 visit identity（visit key + 结构性签名）匹配，不按书面小节号静默重绑；
+- 缺失或结构变化的到达位置会进入 `pending-mismatch`，必须逐项选择重新绑定、保留为不可播放历史或删除；
+- 重复保存相同内容不增加版本；导入同一方案版本不复制段落/版本；本地方案较新会拒绝覆盖；
+- 导出三个文件：
   - `*.musicxml`：原始 XML 文本，不注入标记、不规范化重写；
-  - `*.rehearsal-markers.json`：独立标记、源文件名、XML SHA-256 和导出时间。
+  - `*.rehearsal-markers.json`：独立标记、源文件名、XML SHA-256 和导出时间；
+  - `*.rehearsal-plan.json`：带 XML SHA-256、路径 checksum 和版本历史的方案，导入前校验乐谱摘要。

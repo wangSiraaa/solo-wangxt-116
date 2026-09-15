@@ -1,4 +1,4 @@
-import type { ParsedScore, PathVisit, PerformancePath, TimedPulse } from './types'
+import type { ParsedScore, PathActionKind, PathVisit, PerformancePath, TimedPulse } from './types'
 
 interface RepeatRegion {
   start: number
@@ -18,6 +18,7 @@ interface CursorState {
   pass: number
   ending: number | null
   action: string
+  actionKind: PathActionKind
 }
 
 const MAX_STEPS = 10000
@@ -32,7 +33,7 @@ export function buildPerformancePath(score: ParsedScore): PerformancePath {
   const jump: JumpState = { used: new Set(), afterJump: false, codaArmed: false }
   const visits: PathVisit[] = []
 
-  let cursor: CursorState = { index: 0, boundary: 'left', pass: 1, ending: null, action: '开始' }
+  let cursor: CursorState = { index: 0, boundary: 'left', pass: 1, ending: null, action: '开始', actionKind: 'start' }
 
   let steps = 0
   while (cursor.index < score.measures.length) {
@@ -70,17 +71,28 @@ export function buildPerformancePath(score: ParsedScore): PerformancePath {
     const sequence = visits.length
     const startQuarter = visits.reduce((sum, v) => sum + v.durationQuarters, 0)
     const startTime = visits.reduce((sum, v) => sum + v.durationSeconds, 0)
+    const durationSeconds = measureDurationSeconds(score, cursor.index)
+    const structuralSignature = structuralSignatureString(
+      cursor.index,
+      measure.printedNumber,
+      cursor.pass,
+      cursor.ending,
+      cursor.actionKind
+    )
     visits.push({
       sequence,
+      visitKey: `${String(sequence).padStart(4, '0')}-${shortSignature(structuralSignature)}`,
+      structuralSignature,
       writtenMeasure: cursor.index,
       printedNumber: measure.printedNumber,
       startQuarter,
       durationQuarters: measure.actualQuarters,
       startTime,
-      durationSeconds: measureDurationSeconds(score, cursor.index),
+      durationSeconds,
       pass: cursor.pass,
       endingNumber: cursor.ending,
-      action: cursor.action
+      action: cursor.action,
+      actionKind: cursor.actionKind
     })
 
     if (isFine(score, cursor.index, 'right') && shouldStopAtFine(score, jump)) {
@@ -122,10 +134,11 @@ function chooseEnding(score: ParsedScore, repeats: RepeatRegion[], cursor: Curso
       boundary: 'left',
       pass,
       ending: null,
-      action: `第 ${pass} 遍跳过 ${active.map((e) => `第${e.number}跳房`).join('、')}`
+      action: `第 ${pass} 遍跳过 ${active.map((e) => `第${e.number}跳房`).join('、')}`,
+      actionKind: 'ending-skip'
     }
   }
-  return { ...cursor, pass, ending: selected.number, action: '顺序前进' }
+  return { ...cursor, pass, ending: selected.number, action: '顺序前进', actionKind: 'ending-enter' }
 }
 
 function processRightBoundary(
@@ -137,7 +150,12 @@ function processRightBoundary(
 ): CursorState {
   const repeatEnd = score.markers.find((m) => m.measureIndex === cursor.index && m.location === 'right' && m.type === 'repeat-end')
   if (repeatEnd) {
-    const region = activeRegionFor(score, repeats, cursor.index)
+    let region = activeRegionFor(score, repeats, cursor.index)
+    if (!region) {
+      // A backward repeat with no forward repeat starts from the head, as MusicXML convention implies.
+      region = { start: 0, times: repeatEnd.times ?? 2, visits: 0 }
+      repeats.push(region)
+    }
     if (region) {
       if (region.visits + 1 < region.times) {
         region.visits += 1
@@ -146,7 +164,8 @@ function processRightBoundary(
           boundary: 'left',
           pass: region.visits + 1,
           ending: null,
-          action: `反复：回到书面第 ${region.start + 1} 小节（第 ${region.visits + 1} 遍）`
+          action: `反复：回到书面第 ${region.start + 1} 小节（第 ${region.visits + 1} 遍）`,
+          actionKind: 'repeat-back'
         }
       }
       // Section complete. Keep the record for ending selection until the ending is left.
@@ -164,7 +183,8 @@ function processRightBoundary(
       boundary: 'left',
       pass: cursor.pass,
       ending: null,
-      action: ending.stopMeasure + 1 >= score.measures.length ? '__STOP__' : `离开第${ending.number}跳房，顺序前进`
+      action: ending.stopMeasure + 1 >= score.measures.length ? '__STOP__' : `离开第${ending.number}跳房，顺序前进`,
+      actionKind: ending.stopMeasure + 1 >= score.measures.length ? 'end' : 'ending-leave'
     }
   }
 
@@ -180,7 +200,13 @@ function processRightBoundary(
       else {
         jump.used.add(key)
         jump.codaArmed = true
-        return jumpCursor(score.coda.measureIndex, score.coda.location, `To Coda：跳到书面第 ${score.coda.measureIndex + 1} 小节`, jump)
+        return jumpCursor(
+          score.coda.measureIndex,
+          score.coda.location,
+          `To Coda：跳到书面第 ${score.coda.measureIndex + 1} 小节`,
+          jump,
+          'jump-to-coda'
+        )
       }
     } else {
       const target = explicitJump.target === 'head' ? { measureIndex: 0, location: 'left' as const } : score.segno
@@ -193,7 +219,8 @@ function processRightBoundary(
           target.measureIndex,
           target.location,
           `${explicitJump.raw}：跳到书面第 ${target.measureIndex + 1} 小节${explicitJump.stopAtFine ? '，至 Fine 结束' : ''}`,
-          jump
+          jump,
+          explicitJump.kind === 'ds' ? 'jump-ds' : 'jump-dc'
         )
       }
     }
@@ -205,12 +232,14 @@ function processRightBoundary(
       errors.push('al Coda 已武装，但没有明确的 To Coda 起跳点；不能猜测跳转位置。')
     } else if (cursor.index >= launch.measureIndex) {
       jump.codaArmed = false
-      return jumpCursor(score.coda.measureIndex, score.coda.location, `al Coda：跳到书面第 ${score.coda.measureIndex + 1} 小节`, jump)
+      return jumpCursor(score.coda.measureIndex, score.coda.location, `al Coda：跳到书面第 ${score.coda.measureIndex + 1} 小节`, jump, 'jump-coda')
     }
   }
 
-  if (cursor.index + 1 >= score.measures.length) return { ...cursor, index: cursor.index + 1, action: '__STOP__' }
-  return { ...cursor, index: cursor.index + 1, boundary: 'left', ending: null, action: '顺序前进' }
+  if (cursor.index + 1 >= score.measures.length) {
+    return { ...cursor, index: cursor.index + 1, action: '__STOP__', actionKind: 'end' }
+  }
+  return { ...cursor, index: cursor.index + 1, boundary: 'left', ending: null, action: '顺序前进', actionKind: 'forward' }
 }
 
 function activeRegionFor(score: ParsedScore, repeats: RepeatRegion[], repeatEndIndex: number): RepeatRegion | null {
@@ -226,10 +255,11 @@ function jumpCursor(
   index: number,
   boundary: 'left' | 'right',
   action: string,
-  jump: JumpState
+  jump: JumpState,
+  actionKind: PathActionKind
 ): CursorState {
   jump.afterJump = true
-  return { index, boundary, pass: 1, ending: null, action }
+  return { index, boundary, pass: 1, ending: null, action, actionKind }
 }
 
 function markerAt(score: ParsedScore, index: number, location: 'left' | 'right', type: string): boolean {
@@ -309,6 +339,7 @@ function buildPulses(score: ParsedScore, visits: PathVisit[]): TimedPulse[] {
     positions.forEach((q, i) => {
       pulses.push({
         visitSequence: visit.sequence,
+        visitKey: visit.visitKey,
         writtenMeasure: visit.writtenMeasure,
         printedNumber: measure.printedNumber,
         measureQuarter: q,
@@ -322,6 +353,31 @@ function buildPulses(score: ParsedScore, visits: PathVisit[]): TimedPulse[] {
     })
   }
   return pulses
+}
+
+function structuralSignatureString(
+  writtenMeasure: number,
+  printedNumber: string,
+  pass: number,
+  endingNumber: number | null,
+  actionKind: PathActionKind
+): string {
+  return [
+    `m=${writtenMeasure}`,
+    `printed=${printedNumber}`,
+    `pass=${pass}`,
+    `ending=${endingNumber ?? '-'}`,
+    `action=${actionKind}`
+  ].join('|')
+}
+
+function shortSignature(value: string): string {
+  let hash = 2166136261
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
 }
 
 function beatPositions(groups: number[], actualQuarters: number): number[] {

@@ -7,6 +7,7 @@ export interface Diagnostic {
     | 'MISSING_TEMPO'
     | 'IRREGULAR_MEASURE'
     | 'UNKNOWN_NAVIGATION_TEXT'
+    | 'UNKNOWN_XML_STRUCTURE'
     | 'UNKNOWN_BARLINE_MARKER'
     | 'UNMATCHED_REPEAT_START'
     | 'ENDING_WITHOUT_REPEAT'
@@ -106,8 +107,24 @@ export interface ParsedScore {
   xml: string
 }
 
+export type PathActionKind =
+  | 'start'
+  | 'forward'
+  | 'repeat-back'
+  | 'ending-enter'
+  | 'ending-leave'
+  | 'ending-skip'
+  | 'jump-dc'
+  | 'jump-ds'
+  | 'jump-to-coda'
+  | 'jump-coda'
+  | 'segno'
+  | 'fine'
+  | 'end'
+
 export interface PathVisit {
   sequence: number
+  visitKey: string
   writtenMeasure: number
   printedNumber: string
   startQuarter: number
@@ -117,10 +134,15 @@ export interface PathVisit {
   pass: number
   endingNumber: number | null
   action: string
+  actionKind: PathActionKind
+  /** Content signature independent of the visit's current ordinal in the complete performance path. */
+  structuralSignature: string
 }
 
 export interface TimedPulse {
   visitSequence: number
+  visitKey: string
+  loopIndex?: number
   writtenMeasure: number
   printedNumber: string
   measureQuarter: number
@@ -146,17 +168,129 @@ export interface RehearsalMarker {
   createdAt: number
 }
 
+export interface PathSnapshotVisit {
+  sequence: number
+  visitKey: string
+  structuralSignature: string
+  writtenMeasure: number
+  printedNumber: string
+  pass: number
+  endingNumber: number | null
+  action: string
+  actionKind: PathActionKind
+  startTime: number
+  durationSeconds: number
+}
+
+export interface RehearsalPathSnapshot {
+  computedAt: number
+  xmlSha256: string
+  pathChecksum: string
+  totalSeconds: number
+  visits: PathSnapshotVisit[]
+}
+
+export interface SegmentEndpoint {
+  visitKey: string
+  sequence: number
+  writtenMeasure: number
+  printedNumber: string
+  pass: number
+  endingNumber: number | null
+  actionKind: PathActionKind
+  structuralSignature: string
+}
+
+export interface RehearsalSegment {
+  id: string
+  name: string
+  start: SegmentEndpoint
+  end: SegmentEndpoint
+  loops: number
+  createdAt: number
+  updatedAt: number
+  historical?: boolean
+  note?: string
+}
+
+export interface SessionPosition {
+  segmentId: string
+  visitKey: string
+  loopIndex: number
+  measureQuarter: number
+  updatedAt: number
+  completed: boolean
+}
+
+export interface RehearsalSession {
+  id: string
+  name: string
+  segmentIds: string[]
+  segmentLoops: Record<string, number>
+  position: SessionPosition | null
+  createdAt: number
+  updatedAt: number
+}
+
+export type PlanMismatchKind = 'score-content' | 'missing-visit' | 'structural-signature'
+export type PlanMismatchSubject = 'segment-start' | 'segment-end' | 'session-position'
+
+export interface PlanMismatch {
+  id: string
+  kind: PlanMismatchKind
+  subject: PlanMismatchSubject
+  segmentId?: string
+  sessionId?: string
+  expected: SegmentEndpoint | (SessionPosition & { writtenMeasure?: number; printedNumber?: string })
+  candidates: SegmentEndpoint[]
+  message: string
+  resolved: boolean
+  resolution?: 'rebound' | 'historical' | 'deleted'
+}
+
+export interface RehearsalPlanVersion {
+  id: string
+  version: number
+  createdAt: number
+  changeSummary: string
+  contentHash: string
+  xmlSha256: string
+  pathChecksum: string
+  segments: RehearsalSegment[]
+  sessions: RehearsalSession[]
+  mismatches: PlanMismatch[]
+}
+
+export interface RehearsalPlan {
+  id: string
+  name: string
+  xmlSha256: string
+  pathChecksum: string
+  status: 'ready' | 'pending-mismatch' | 'historical'
+  currentSnapshot: RehearsalPathSnapshot
+  segments: RehearsalSegment[]
+  sessions: RehearsalSession[]
+  mismatches: PlanMismatch[]
+  versions: RehearsalPlanVersion[]
+  createdAt: number
+  updatedAt: number
+  migratedFromLegacyMarkers?: boolean
+}
+
 export interface StoredProject {
   id: string
   title: string
   fileName: string
   xml: string
+  xmlSha256?: string
   markers: RehearsalMarker[]
+  plan?: RehearsalPlan | null
+  schemaVersion?: 1 | 2
   updatedAt: number
   createdAt: number
 }
 
-export interface ExportBundle {
+export interface MarkerExportBundle {
   schema: 'rehearsal-stand-markers/v1'
   title: string
   sourceFileName: string
@@ -164,3 +298,14 @@ export interface ExportBundle {
   markers: RehearsalMarker[]
   exportedAt: number
 }
+
+export interface PlanExportBundle {
+  schema: 'rehearsal-stand-plan/v1'
+  title: string
+  sourceFileName: string
+  xmlSha256: string
+  exportedAt: number
+  plan: RehearsalPlan
+}
+
+export type ExportBundle = MarkerExportBundle | PlanExportBundle

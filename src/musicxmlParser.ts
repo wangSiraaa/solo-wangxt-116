@@ -103,6 +103,7 @@ export function parseMusicXml(xml: string, fileName = 'score.musicxml'): ParsedS
     measures.forEach((measure, measureIndex) => {
       const ctx = raw[measureIndex]
       if (!ctx) return
+      inspectUnknownStructure(measure, partId, measureIndex, diagnostics)
       ctx.partIds.push(partId)
       if (measureIndex === 0) ctx.printedNumber = measure.getAttribute('number') || '1'
       else if (measure.getAttribute('number')) ctx.printedNumber = measure.getAttribute('number')!
@@ -208,7 +209,7 @@ export function parseMusicXml(xml: string, fileName = 'score.musicxml'): ParsedS
               })
             }
           }
-          collectNavigationText(child, measureIndex, 'right', jumps, fineCandidates, diagnostics)
+          collectDirectionSymbols(child, measureIndex, jumps, segnoCandidates, codaCandidates, fineCandidates, diagnostics)
         }
 
         if (child.localName === 'barline') {
@@ -317,6 +318,7 @@ export function parseMusicXml(xml: string, fileName = 'score.musicxml'): ParsedS
   }
 
   dedupeMarkers(markers)
+  dedupeJumps(jumps)
   validateEndingMarkers(markers, measures.length, diagnostics)
   const endings = buildEndingRanges(markers, diagnostics)
   validateRepeats(markers, endings, diagnostics)
@@ -333,6 +335,7 @@ export function parseMusicXml(xml: string, fileName = 'score.musicxml'): ParsedS
   )
 
   const title = text(doc, 'work-title') || text(doc, 'movement-title') || fileName.replace(/\.(musicxml|xml)$/i, '')
+  dedupeDiagnostics(diagnostics)
   return {
     title,
     partIds: partIds.filter(Boolean),
@@ -476,14 +479,202 @@ function collectBarline(
   }
 }
 
-function collectNavigationText(
+const MEASURE_CHILDREN = new Set([
+  'attributes',
+  'backup',
+  'barline',
+  'bookmark',
+  'direction',
+  'figured-bass',
+  'forward',
+  'grouping',
+  'harmony',
+  'link',
+  'listening',
+  'note',
+  'print',
+  'sound'
+])
+
+const NOTE_CHILDREN = new Set([
+  'accidental',
+  'articulations',
+  'beam',
+  'chord',
+  'cue',
+  'dot',
+  'duration',
+  'dynamic-override',
+  'footnote',
+  'glissando',
+  'grace',
+  'instrument',
+  'level',
+  'listen',
+  'lyric',
+  'notations',
+  'notehead',
+  'notehead-text',
+  'pitch',
+  'play',
+  'rest',
+  'slide',
+  'sound',
+  'staff',
+  'stem',
+  'tie',
+  'time-modification',
+  'type',
+  'unpitched',
+  'voice'
+])
+
+const ATTRIBUTE_CHILDREN = new Set([
+  'cancel',
+  'clef',
+  'clef-octave-change',
+  'divisions',
+  'editorial',
+  'footnote',
+  'key',
+  'level',
+  'measure-style',
+  'part-symbol',
+  'staff-details',
+  'staves',
+  'time',
+  'transpose',
+  'xml:lang'
+])
+
+const DIRECTION_CHILDREN = new Set([
+  'direction-type',
+  'footnote',
+  'level',
+  'listening',
+  'offset',
+  'sound',
+  'staff',
+  'voice'
+])
+
+const DIRECTION_TYPE_CHILDREN = new Set([
+  'accordion-registration',
+  'bracket',
+  'coda',
+  'dahs',
+  'dynamics',
+  'extend',
+  'eyeglasses',
+  'fine',
+  'hairpin',
+  'image',
+  'metronome',
+  'octave-shift',
+  'pedal',
+  'percussion',
+  'principal-voice',
+  'rehearsal',
+  'scordatura',
+  'segno',
+  'staff-divide',
+  'string-mute',
+  'wedge',
+  'words'
+])
+
+function inspectUnknownStructure(
+  measure: Element,
+  partId: string,
+  measureIndex: number,
+  diagnostics: Diagnostic[]
+) {
+  const measureNumber = measure.getAttribute('number') || String(measureIndex + 1)
+  let noteIndex = 0
+  for (const child of Array.from(measure.children)) {
+    if (!MEASURE_CHILDREN.has(child.localName)) {
+      pushUnknownElement(diagnostics, measureIndex, partId, measureNumber, child, 'measure')
+    }
+    if (child.localName === 'note') {
+      noteIndex += 1
+      inspectKnownContainer(child, NOTE_CHILDREN, partId, measureNumber, measureIndex, diagnostics, `note[${noteIndex}]`)
+    }
+    if (child.localName === 'attributes') {
+      inspectKnownContainer(child, ATTRIBUTE_CHILDREN, partId, measureNumber, measureIndex, diagnostics, 'attributes')
+    }
+    if (child.localName === 'direction') {
+      inspectKnownContainer(child, DIRECTION_CHILDREN, partId, measureNumber, measureIndex, diagnostics, 'direction')
+      for (const [directionIndex, directionType] of Array.from(child.children)
+        .filter((node) => node.localName === 'direction-type')
+        .entries()) {
+        inspectKnownContainer(
+          directionType,
+          DIRECTION_TYPE_CHILDREN,
+          partId,
+          measureNumber,
+          measureIndex,
+          diagnostics,
+          `direction[${directionIndex + 1}]/direction-type`
+        )
+      }
+    }
+  }
+}
+
+function inspectKnownContainer(
+  parent: Element,
+  allowed: Set<string>,
+  partId: string,
+  measureNumber: string,
+  measureIndex: number,
+  diagnostics: Diagnostic[],
+  context: string
+) {
+  for (const child of Array.from(parent.children)) {
+    if (!allowed.has(child.localName)) {
+      pushUnknownElement(diagnostics, measureIndex, partId, measureNumber, child, context)
+    }
+  }
+}
+
+function pushUnknownElement(
+  diagnostics: Diagnostic[],
+  measureIndex: number,
+  partId: string,
+  measureNumber: string,
+  element: Element,
+  context: string
+) {
+  const path = `/score-partwise/part[@id='${partId}']/measure[@number='${measureNumber}']/${context}/${element.localName}`
+  diagnostics.push({
+    level: 'warning',
+    code: 'UNKNOWN_XML_STRUCTURE',
+    measureIndex,
+    elementPath: path,
+    message:
+      `发现未纳入演奏路径语义的 MusicXML 结构 <${element.localName}>（${path}）。原 XML 已原样保留；` +
+      `路径仍会进入该书面小节并按已知 <duration>/拍号计算，但不会猜测此符号对跳转或时长的影响。`
+  })
+}
+
+function collectDirectionSymbols(
   direction: Element,
   measureIndex: number,
-  location: 'left' | 'right',
   jumps: JumpInstruction[],
+  segno: Array<{ measureIndex: number; location: 'left' | 'right' }>,
+  coda: Array<{ measureIndex: number; location: 'left' | 'right' }>,
   fine: Array<{ measureIndex: number; location: 'left' | 'right' }>,
   diagnostics: Diagnostic[]
 ) {
+  const location: 'left' | 'right' = 'right'
+  for (const directionType of Array.from(direction.children).filter((c) => c.localName === 'direction-type')) {
+    for (const child of Array.from(directionType.children)) {
+      if (child.localName === 'segno') segno.push({ measureIndex, location })
+      if (child.localName === 'coda') coda.push({ measureIndex, location })
+      if (child.localName === 'fine') fine.push({ measureIndex, location })
+    }
+  }
+
   const candidates = Array.from(direction.querySelectorAll('words,rehearsal'))
   for (const node of candidates) {
     const raw = node.textContent?.trim() ?? ''
@@ -567,6 +758,26 @@ function dedupeMarkers(markers: BarlineMarker[]) {
     seen.add(key)
   }
   markers.sort((a, b) => a.measureIndex - b.measureIndex)
+}
+
+function dedupeJumps(jumps: JumpInstruction[]) {
+  const seen = new Set<string>()
+  for (let i = jumps.length - 1; i >= 0; i--) {
+    const jump = jumps[i]
+    const key = `${jump.kind}-${jump.measureIndex}-${jump.location}-${jump.raw}`
+    if (seen.has(key)) jumps.splice(i, 1)
+    seen.add(key)
+  }
+}
+
+function dedupeDiagnostics(diagnostics: Diagnostic[]) {
+  const seen = new Set<string>()
+  for (let i = diagnostics.length - 1; i >= 0; i--) {
+    const d = diagnostics[i]
+    const key = `${d.level}-${d.code}-${d.measureIndex}-${d.elementPath ?? ''}-${d.message}`
+    if (seen.has(key)) diagnostics.splice(i, 1)
+    seen.add(key)
+  }
 }
 
 function validateEndingMarkers(markers: BarlineMarker[], measureCount: number, diagnostics: Diagnostic[]) {

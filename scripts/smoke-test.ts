@@ -53,4 +53,17 @@ const dsPath = buildPerformancePath(dsScore)
 assert(dsPath.errors.length === 0, `D.S. al Fine path should close: ${dsPath.errors.join('; ')}`)
 assert(dsPath.visits.map((v) => v.writtenMeasure).join(',') === '0,1,2,1', 'D.S. al Fine should revisit the Segno measure and stop at Fine')
 
+const unknownXml = dsFine.replace(
+  '<duration>4</duration></note></measure>',
+  '<duration>4</duration></note><note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><rehearsal:alien-bow xmlns:rehearsal="https://example.test/extension"/></note></measure>'
+)
+const unknownScore = parseMusicXml(unknownXml, 'unknown.xml')
+const unknownPath = buildPerformancePath(unknownScore)
+assert(
+  unknownScore.diagnostics.some((d) => d.code === 'UNKNOWN_XML_STRUCTURE' && d.message.includes('<alien-bow>')),
+  'unknown direct note child must produce a visible structure diagnostic'
+)
+assert(unknownScore.xml.includes('rehearsal:alien-bow'), 'original XML containing unknown element must be retained')
+assert(unknownPath.visits.length > 0, 'path must still visit measures instead of silently skipping unknown notation')
+
 console.log('smoke tests passed')

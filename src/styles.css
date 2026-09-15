@@ -148,7 +148,8 @@ button:disabled {
   justify-content: space-between;
   gap: 12px;
 }
-.topbar .title {
+.title-main,
+.title {
   font-size: 18px;
   font-weight: 800;
 }
@@ -268,6 +269,11 @@ tr.active {
 .diagnostic.info {
   border-left: 4px solid #60a5fa;
 }
+.diagnostic-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #cbd5e1;
+}
 .pill {
   font-size: 11px;
   padding: 2px 7px;
@@ -278,4 +284,46 @@ tr.active {
 .current-pulse {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   color: #fef08a;
+}
+.plan-header {
+  margin-bottom: 10px;
+}
+.plan-header input {
+  min-width: 0;
+}
+.mismatch-list h3,
+.plan-header + h3,
+.card h3 {
+  color: #bfdbfe;
+  font-size: 13px;
+  margin: 12px 0 6px;
+}
+.segment-card {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 9px;
+  padding: 9px;
+  margin: 8px 0;
+}
+.segment-card.historical {
+  opacity: 0.62;
+}
+.sequence-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #dbeafe;
+  margin: 6px 0;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.session-line {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 6px;
+  font-size: 12px;
+}
+.small {
+  max-height: 150px;
+}
+.mismatch-list select {
+  margin-top: 6px;
 }

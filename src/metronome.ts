@@ -4,7 +4,7 @@ export interface MetronomeOptions {
   audio: AudioContext
   onPulse?: (pulse: TimedPulse, measureFraction: number) => void
   onVisit?: (visit: PathVisit) => void
-  onStop?: () => void
+  onStop?: (completed: boolean) => void
 }
 
 const LOOKAHEAD_SECONDS = 0.12
@@ -22,8 +22,8 @@ export class Metronome {
   private rate = 1
   private onPulse?: (pulse: TimedPulse, measureFraction: number) => void
   private onVisit?: (visit: PathVisit) => void
-  private onStop?: () => void
-  private scheduledVisitKeys = new Set<number>()
+  private onStop?: (completed: boolean) => void
+  private scheduledVisitKeys = new Set<string>()
 
   constructor(options: MetronomeOptions) {
     this.audio = options.audio
@@ -41,8 +41,15 @@ export class Metronome {
     return this.timer !== null
   }
 
+  startCustom(customPulses: TimedPulse[], customVisits: PathVisit[], rate = 1) {
+    this.stop(false, false)
+    this.pulses = customPulses
+    this.visits = customVisits
+    this.start(0, rate)
+  }
+
   start(atVisitSequence = 0, rate = 1) {
-    this.stop(false)
+    this.stop(false, false)
     const visit = this.visits.find((v) => v.sequence === atVisitSequence) ?? this.visits[0]
     if (!visit) return
     this.rate = rate
@@ -57,7 +64,7 @@ export class Metronome {
     this.schedule()
   }
 
-  stop(notify = true) {
+  stop(notify = true, completed = false) {
     if (this.timer !== null) {
       clearInterval(this.timer)
       this.timer = null
@@ -66,11 +73,11 @@ export class Metronome {
       clearTimeout(this.stopTimer)
       this.stopTimer = null
     }
-    if (notify) this.onStop?.()
+    if (notify) this.onStop?.(completed)
   }
 
   dispose() {
-    this.stop(false)
+    this.stop(false, false)
   }
 
   private schedule() {
@@ -81,13 +88,14 @@ export class Metronome {
       const when = this.startAudioTime + ((pulse.time - this.startPerformanceTime) / this.rate)
       if (when > horizon) break
       this.scheduleClick(pulse, when)
-      const visit = this.visits.find((v) => v.sequence === pulse.visitSequence)
-      const fraction = visit && visit.durationQuarters > 0 ? pulse.measureQuarter / visit.durationQuarters : 0
-      if (visit && !this.scheduledVisitKeys.has(visit.sequence)) {
+      const visit = this.visits.find((v) => v.visitKey === pulse.visitKey)
+      const scheduleKey = `${pulse.loopIndex ?? 0}:${pulse.visitKey}`
+      if (visit && !this.scheduledVisitKeys.has(scheduleKey)) {
         const visitTime = this.startAudioTime + ((visit.startTime - this.startPerformanceTime) / this.rate)
-        this.scheduledVisitKeys.add(visit.sequence)
+        this.scheduledVisitKeys.add(scheduleKey)
         window.setTimeout(() => this.onVisit?.(visit), Math.max(0, (visitTime - this.audio.currentTime) * 1000))
       }
+      const fraction = visit && visit.durationQuarters > 0 ? pulse.measureQuarter / visit.durationQuarters : 0
       const visualDelay = Math.max(0, (when - this.audio.currentTime) * 1000)
       window.setTimeout(() => this.onPulse?.(pulse, fraction), visualDelay)
       this.nextPulseIndex += 1
@@ -97,7 +105,7 @@ export class Metronome {
       this.timer = null
       const last = this.pulses[this.pulses.length - 1]
       const endAt = this.startAudioTime + ((last.time - this.startPerformanceTime) / this.rate) + 0.3 / this.rate
-      this.stopTimer = window.setTimeout(() => this.stop(true), Math.max(0, (endAt - this.audio.currentTime) * 1000))
+      this.stopTimer = window.setTimeout(() => this.stop(true, true), Math.max(0, (endAt - this.audio.currentTime) * 1000))
     }
   }
 
