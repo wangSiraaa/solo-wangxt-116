@@ -79,14 +79,14 @@ async function installAudioProbe(page: Page) {
   })
 }
 
-async function collectDownloads(page: Page, action: () => Promise<void>) {
+async function collectDownloads(page: Page, action: () => Promise<void>, min = 3) {
   const events: import('@playwright/test').Download[] = []
   const listener = (download: import('@playwright/test').Download) => {
     if (!events.some((existing) => existing.suggestedFilename() === download.suggestedFilename())) events.push(download)
   }
   page.on('download', listener)
   await action()
-  await expect.poll(() => events.length).toBeGreaterThanOrEqual(3)
+  await expect.poll(() => events.length).toBeGreaterThanOrEqual(min)
   await page.waitForTimeout(500)
   page.off('download', listener)
   const results = await Promise.all(
@@ -359,4 +359,173 @@ test('三项队列逐项完成、刷新恢复、完整播放后历史不重复',
     plan?: { queues?: Array<{ completions: unknown[] }> }
   }>
   expect(reimportedProjects.at(-1)?.plan?.queues?.[0]?.completions).toHaveLength(3)
+})
+
+async function setupProposalBase(page: Page) {
+  await page.goto('/')
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  await page.getByTestId('segment-name').fill('共享段落')
+  await page.getByTestId('segment-start').selectOption({ index: 5 })
+  await page.getByTestId('segment-end').selectOption({ index: 10 })
+  await page.getByTestId('save-segment').click()
+
+  await page.getByTestId('queue-name').fill('一提')
+  await page.getByTestId('add-queue').click()
+  await page.getByTestId('queue-name').fill('二提')
+  await page.getByTestId('add-queue').click()
+  const queues = page.getByTestId('queue-card')
+  for (const index of [0, 1]) {
+    await queues.nth(index).locator('select').last().selectOption({ label: '共享段落' })
+    await queues.nth(index).getByRole('button', { name: '加入' }).click()
+  }
+  return queues
+}
+
+async function exportProposalFromUI(page: Page, name: string) {
+  const downloaded = await collectDownloads(
+    page,
+    async () => {
+      await page.locator('[data-testid^="proposal-"]', { hasText: name }).getByTestId('export-proposal').click()
+    },
+    1
+  )
+  return downloaded.results[0].content
+}
+
+async function importProposalContent(page: Page, content: string) {
+  await page.evaluate((text) => {
+    const file = new File([text], 'proposal.json', { type: 'application/json' })
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    const input = document.querySelector<HTMLInputElement>('input[data-testid="proposal-file"]')!
+    if (!input) throw new Error('missing proposal input')
+    input.files = dt.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }, content)
+  await page.waitForTimeout(250)
+}
+
+async function importProposalContentViaPlanFile(page: Page, content: string) {
+  await page.evaluate((text) => {
+    const file = new File([text], 'proposal.json', { type: 'application/json' })
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    const input = document.querySelector<HTMLInputElement>('input[data-testid="plan-file"]')!
+    if (!input) throw new Error('missing plan input')
+    input.files = dt.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }, content)
+  await page.waitForTimeout(250)
+}
+
+test('变更提案：不同分部无冲突合并，重复/乱序导入幂等，历史不回退', async ({ page }) => {
+  await setupProposalBase(page)
+  const queues = page.getByTestId('queue-card')
+
+  await page.getByPlaceholder('作者/分部').fill('一提')
+  await page.getByPlaceholder('提案名称').fill('一提提速')
+  await page.getByRole('button', { name: '基于当前版本建提案' }).click()
+  const proposalCard = page.locator('[data-testid^="proposal-"]', { hasText: '一提提速' })
+  await proposalCard.locator('.proposal-editor.active [data-testid="proposal-queue-select"]').selectOption({ label: '一提' })
+  await proposalCard.locator('.proposal-editor.active [data-testid="proposal-item-select"]').selectOption({ label: '共享段落' })
+  await proposalCard.locator('.proposal-editor.active [data-testid="proposal-item-tempo"]').fill('1.25')
+  await proposalCard.locator('.proposal-editor.active [data-testid="proposal-item-apply"]').click()
+  await page.waitForTimeout(100)
+  const storedAfterA = (await readProjects(page)) as Array<{
+    proposals?: Array<{ name: string; queues?: unknown[] }>
+  }>
+  const currentProject = storedAfterA.find((item) => item.proposals?.some((proposal) => proposal.name === '一提提速'))
+  const editedA = currentProject?.proposals?.find((proposal) => proposal.name === '一提提速')
+  expect(currentProject?.proposals?.some((proposal) => proposal.name === '一提提速')).toBe(true)
+  expect(editedA).toBeTruthy()
+  expect(editedA?.queues ?? []).toHaveLength(2)
+
+  const proposalA = await exportProposalFromUI(page, '一提提速')
+  const proposalBundleA = JSON.parse(proposalA) as {
+    proposal: { queues: Array<{ name: string; items: Array<{ tempoScale: number }> }> }
+  }
+  expect(proposalBundleA.proposal.queues.find((queue) => queue.name === '一提')?.items[0]?.tempoScale).toBe(1.25)
+
+  await page.getByPlaceholder('作者/分部').fill('二提')
+  await page.getByPlaceholder('提案名称').fill('二提减速')
+  await page.getByRole('button', { name: '基于当前版本建提案' }).click()
+  const proposalB = page.locator('[data-testid^="proposal-"]', { hasText: '二提减速' })
+  await proposalB.locator('.proposal-editor.active [data-testid="proposal-queue-select"]').selectOption({ label: '二提' })
+  await proposalB.locator('.proposal-editor.active [data-testid="proposal-item-select"]').selectOption({ label: '共享段落' })
+  await proposalB.locator('.proposal-editor.active [data-testid="proposal-item-tempo"]').fill('0.75')
+  await proposalB.locator('.proposal-editor.active [data-testid="proposal-item-apply"]').click()
+  const proposalBJson = await exportProposalFromUI(page, '二提减速')
+
+  // Import in reverse order: B then A. Both touch different queues, so no conflict version is needed.
+  for (const content of [proposalBJson, proposalA, proposalA]) {
+    await importProposalContent(page, content)
+  }
+  await expect(queues.nth(0)).toContainText('♩125%')
+  await expect(queues.nth(1)).toContainText('♩75%')
+  const projects = (await readProjects(page)) as Array<{ mergeRecords?: unknown[]; proposals?: unknown[] }>
+  expect(projects.at(-1)?.mergeRecords).toHaveLength(2)
+  expect(projects.at(-1)?.proposals).toHaveLength(2)
+})
+
+test('变更提案：共享队列项同字段冲突可逐项决议，刷新保留，合并可撤销', async ({ page }) => {
+  await setupProposalBase(page)
+
+  async function makeProposal(author: string, name: string, tempo: string) {
+    await page.getByPlaceholder('作者/分部').fill(author)
+    await page.getByPlaceholder('提案名称').fill(name)
+    await page.getByRole('button', { name: '基于当前版本建提案' }).click()
+    const card = page.locator('[data-testid^="proposal-"]', { hasText: name })
+    await card.locator('.proposal-editor.active [data-testid="proposal-queue-select"]').selectOption({ label: '一提' })
+    await card.locator('.proposal-editor.active [data-testid="proposal-item-select"]').selectOption({ label: '共享段落' })
+    await card.locator('.proposal-editor.active [data-testid="proposal-item-tempo"]').fill(tempo)
+    await card.locator('.proposal-editor.active [data-testid="proposal-item-apply"]').click()
+    return exportProposalFromUI(page, name)
+  }
+  const proposalA = await makeProposal('指挥', '指挥加速', '1.5')
+  // Local conflicting modification after proposal export: same queue item, same field.
+  const projectsBefore = (await readProjects(page)) as Array<{
+    plan?: { queues?: Array<{ items: Array<{ id: string; tempoScale: number }> }> }
+  }>
+  const localItemId = projectsBefore.at(-1)?.plan?.queues?.[0]?.items[0]?.id
+  await page.evaluate((itemId) => {
+    return new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open('rehearsal-stand')
+      open.onsuccess = () => {
+        const db = open.result
+        const tx = db.transaction('projects', 'readwrite')
+        const get = tx.objectStore('projects').getAll()
+        get.onsuccess = () => {
+          const project = get.result.at(-1)
+          const item = project.plan.queues[0].items.find((candidate: { id: string }) => candidate.id === itemId)
+          item.tempoScale = 0.5
+          tx.objectStore('projects').put(project)
+        }
+        tx.oncomplete = () => {
+          db.close()
+          resolve()
+        }
+        tx.onerror = () => reject(tx.error)
+      }
+    })
+  }, localItemId)
+  await page.reload()
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+
+  await importProposalContent(page, proposalA)
+  await expect(page.locator('[data-testid^="pending-merge-"]')).toBeVisible()
+  await expect(page.locator('[data-testid^="pending-merge-"]')).toContainText('item.tempoScale')
+  await expect(page.getByTestId('apply-merge')).toBeDisabled()
+
+  await page.reload()
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  await expect(page.locator('[data-testid^="pending-merge-"]')).toBeVisible()
+  const conflict = page.locator('[data-testid^="pending-merge-"] .diagnostic').first()
+  await conflict.getByRole('button', { name: '采用提案' }).click()
+  await page.getByTestId('apply-merge').click()
+  await expect(page.getByTestId('queue-card').first()).toContainText('♩150%')
+
+  const undo = page.getByTestId('undo-merge')
+  await expect(undo).toBeVisible()
+  await undo.click()
+  await expect(page.getByTestId('undo-merge')).toHaveCount(0)
 })

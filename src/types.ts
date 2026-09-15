@@ -336,6 +336,103 @@ export interface RehearsalPlan {
   migratedFromLegacyMarkers?: boolean
 }
 
+export type ProposalOpType =
+  | 'segment.add'
+  | 'segment.update'
+  | 'segment.delete'
+  | 'queue.add'
+  | 'queue-item.add'
+  | 'queue-item.update'
+  | 'queue-item.reorder'
+  | 'queue-item.delete'
+
+export interface ProposalOp {
+  id: string
+  type: ProposalOpType
+  at: number
+  /** Stable target id: segment id, queue id or queue-item id. */
+  targetId: string
+  summary: string
+  before?: unknown
+  after?: unknown
+  /** Application order; explicit so out-of-order import can be normalized. */
+  order: number
+  contentHash: string
+}
+
+export interface ProposalBaseRef {
+  planId: string
+  versionId: string
+  version: number
+  xmlSha256: string
+  pathChecksum: string
+  at: number
+}
+
+export interface RehearsalChangeProposal {
+  id: string
+  name: string
+  author: string
+  base: ProposalBaseRef
+  /** Working snapshot created by the proposal author: segments and queues only, never completions. */
+  segments: RehearsalSegment[]
+  queues: PartQueue[]
+  ops: ProposalOp[]
+  contentHash: string
+  createdAt: number
+  updatedAt: number
+  status: 'draft' | 'exported' | 'imported' | 'merged' | 'superseded'
+}
+
+export type MergeConflictField =
+  | 'segment.name'
+  | 'segment.start'
+  | 'segment.end'
+  | 'segment.loops'
+  | 'segment.historical'
+  | 'item.loops'
+  | 'item.tempoScale'
+  | 'item.start'
+  | 'item.end'
+  | 'item.status'
+  | 'queue.order'
+  | 'queue.position'
+
+export interface MergeConflict {
+  id: string
+  proposalId: string
+  entityType: 'segment' | 'queue-item' | 'queue'
+  entityId: string
+  entityLabel: string
+  field: MergeConflictField
+  base: unknown
+  local: unknown
+  proposal: unknown
+  resolution?: 'local' | 'proposal' | 'merge'
+  mergedValue?: unknown
+  resolvedAt?: number
+}
+
+export interface MergeRecord {
+  id: string
+  proposalId: string
+  proposalName: string
+  appliedAt: number
+  versionAfter: number
+  /** Per-field inverse snapshot, scoped to entities touched by the proposal. */
+  inverse: Array<{ entityType: 'segment' | 'queue-item' | 'queue'; entityId: string; field: MergeConflictField; before: unknown; after: unknown }>
+  /** Fields modified locally after the merge; undo must skip them. */
+  skippedUndoFields: string[]
+  undoneAt?: number
+}
+
+export interface PendingMerge {
+  proposal: RehearsalChangeProposal
+  conflicts: MergeConflict[]
+  /** Changes that can be applied automatically once conflicts are resolved. */
+  startedAt: number
+}
+
 export interface StoredProject {
   id: string
   title: string
@@ -343,6 +440,9 @@ export interface StoredProject {
   xml: string
   xmlSha256?: string
   markers: RehearsalMarker[]
+  proposals?: RehearsalChangeProposal[]
+  pendingMerges?: PendingMerge[]
+  mergeRecords?: MergeRecord[]
   plan?: RehearsalPlan | null
   schemaVersion?: 1 | 2
   updatedAt: number
@@ -367,4 +467,13 @@ export interface PlanExportBundle {
   plan: RehearsalPlan
 }
 
-export type ExportBundle = MarkerExportBundle | PlanExportBundle
+export interface ProposalExportBundle {
+  schema: 'rehearsal-stand-proposal/v1'
+  title: string
+  sourceFileName: string
+  xmlSha256: string
+  exportedAt: number
+  proposal: RehearsalChangeProposal
+}
+
+export type ExportBundle = MarkerExportBundle | PlanExportBundle | ProposalExportBundle

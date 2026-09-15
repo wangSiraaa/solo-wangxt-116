@@ -107,9 +107,10 @@ export function buildQueuePlayback(
   queue: PartQueue,
   allVisits: PathVisit[],
   allPulses: TimedPulse[],
-  resume: QueuePosition | null
+  resume: QueuePosition | null,
+  blockedItemIds: ReadonlySet<string> = new Set()
 ): QueuePlayback | null {
-  const playableItems = queue.items.filter((item) => item.status === 'ready')
+  const playableItems = queue.items.filter((item) => item.status === 'ready' && !blockedItemIds.has(item.id))
   if (!playableItems.length || playableItems.length !== queue.items.length) return null
   const resumeItemId = resume?.itemId
   const startIndex = resume ? playableItems.findIndex((item) => item.id === resumeItemId) : 0

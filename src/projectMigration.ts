@@ -74,8 +74,9 @@ export async function importPlanBundle(
   const incomingVersion = bundle.plan.versions[0]?.version ?? 1
   const localVersion = localPlan.versions[0]?.version ?? 1
 
+  if (!localPlan.queues) localPlan.queues = []
   const incomingQueues: PartQueue[] = Array.isArray(bundle.plan.queues) ? bundle.plan.queues : []
-  const localQueues: PartQueue[] = Array.isArray(localPlan.queues) ? localPlan.queues : []
+  const localQueues: PartQueue[] = localPlan.queues
   const localByContent = new Map(localQueues.map((queue) => [queueContentHash(queue), queue]))
   let addedQueues = 0
   const mergedQueues = localQueues.map((queue) => plainClone(queue))

@@ -10,8 +10,10 @@
           <button class="primary" @click="loadSample">载入双跳房/变速/多声部样例</button>
           <button @click="fileInput?.click()">打开 MusicXML</button>
           <button @click="planFileInput?.click()">导入方案 JSON</button>
+          <button @click="proposalFileInput?.click()">导入提案</button>
           <input ref="fileInput" data-testid="score-file" hidden type="file" accept=".xml,.musicxml,application/xml" @change="onFile" />
           <input ref="planFileInput" data-testid="plan-file" hidden type="file" accept=".json,application/json" @change="onPlanImport" />
+          <input ref="proposalFileInput" data-testid="proposal-file" hidden type="file" accept=".json,application/json" @change="onPlanImport" />
         </div>
         <label>IndexedDB 本地工程</label>
         <select v-if="projects.length" :value="currentProjectId" @change="openProject(($event.target as HTMLSelectElement).value)">
@@ -228,6 +230,74 @@
             </div>
           </div>
 
+          <h3>变更提案与三方合并</h3>
+          <div class="row">
+            <input v-model="proposalAuthor" placeholder="作者/分部" style="width:110px" />
+            <input v-model="proposalName" placeholder="提案名称" style="flex:1" />
+            <button :disabled="!proposalName.trim() || !proposalAuthor.trim()" @click="createDraftProposal">基于当前版本建提案</button>
+          </div>
+          <div v-for="proposal in project?.proposals ?? []" :key="proposal.id" class="proposal-card" :data-testid="`proposal-${proposal.id}`">
+            <div class="row between">
+              <b>{{ proposal.name }}</b>
+              <span class="pill">基线 v{{ proposal.base.version }}</span>
+              <span class="badge info">{{ proposal.status }}</span>
+            </div>
+            <div class="muted">作者：{{ proposal.author }} · 内容 {{ shortHash(proposal.contentHash) }} · 操作 {{ proposal.ops.length }}</div>
+            <div class="row proposal-editor" :class="{ active: activeProposalId === proposal.id }" v-if="true">
+              <select v-model="proposalQueueId" data-testid="proposal-queue-select" :disabled="activeProposalId !== proposal.id" style="flex:1">
+                <option value="">选择队列…</option>
+                <option v-for="q in proposal.queues" :key="q.id" :value="q.id">{{ q.name }}</option>
+              </select>
+              <select v-model="proposalItemId" data-testid="proposal-item-select" :disabled="activeProposalId !== proposal.id" style="flex:1">
+                <option value="">选择队列项…</option>
+                <option v-for="item in proposalQueueItems" :key="item.id" :value="item.id">{{ item.segmentName }}</option>
+              </select>
+              <input v-model.number="proposalItemLoops" data-testid="proposal-item-loops" type="number" min="1" title="循环" style="width:70px" />
+              <input v-model.number="proposalItemTempo" data-testid="proposal-item-tempo" type="number" min="0.25" step="0.05" title="速度" style="width:80px" />
+              <button data-testid="proposal-item-apply" :disabled="!proposalItemId" @click="editActiveProposalItem">调整</button>
+              <button :disabled="!proposalItemId" @click="moveActiveProposalItem(-1)">↑</button>
+              <button :disabled="!proposalItemId" @click="moveActiveProposalItem(1)">↓</button>
+              <button class="danger" :disabled="!proposalItemId" @click="deleteActiveProposalItem">删</button>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <button data-testid="export-proposal" @click="exportActiveProposal(proposal)">导出提案</button>
+              <span class="muted">{{ proposalMergeStatus(proposal.id) }}</span>
+            </div>
+            <details>
+              <summary>操作时间线</summary>
+              <ul class="op-list">
+                <li v-for="op in proposal.ops" :key="op.id">{{ formatDate(op.at) }} · {{ op.summary }}</li>
+              </ul>
+            </details>
+          </div>
+
+          <div v-for="pending in project?.pendingMerges ?? []" :key="pending.proposal.id" class="mismatch-list" :data-testid="`pending-merge-${pending.proposal.id}`">
+            <h3>待处理合并：{{ pending.proposal.name }}</h3>
+            <p class="muted">刷新后仍保留；未解决冲突时不能合并或播放受影响队列。</p>
+            <div v-for="conflict in pending.conflicts" :key="conflict.id" class="diagnostic warning">
+              <b>{{ conflict.entityLabel }} · {{ conflict.field }}</b>
+              <div class="muted">基线：{{ formatConflictValue(conflict.base) }} ｜ 本地：{{ formatConflictValue(conflict.local) }} ｜ 提案：{{ formatConflictValue(conflict.proposal) }}</div>
+              <div class="row">
+                <button :class="{ active: conflict.resolution === 'local' }" @click="resolvePendingConflict(pending.proposal.id, conflict.id, 'local')">采用本地</button>
+                <button :class="{ active: conflict.resolution === 'proposal' }" @click="resolvePendingConflict(pending.proposal.id, conflict.id, 'proposal')">采用提案</button>
+              </div>
+            </div>
+            <div class="row">
+              <button class="primary" data-testid="apply-merge" :disabled="hasUnresolvedConflict(pending.proposal.id)" @click="applyPendingMerge(pending.proposal.id)">应用合并并建版本</button>
+              <button @click="discardPendingMerge(pending.proposal.id)">保留为待处理历史</button>
+            </div>
+          </div>
+
+          <div v-if="(project?.mergeRecords ?? []).length">
+            <h3>合并记录 / 撤销</h3>
+            <div v-for="record in project?.mergeRecords ?? []" :key="record.id" class="proposal-card">
+              <b>{{ record.proposalName }}</b>
+              <span class="pill">v{{ record.versionAfter }}</span>
+              <span v-if="record.undoneAt" class="badge warning">已撤销</span>
+              <button v-else data-testid="undo-merge" @click="undoRecord(record.id)">撤销本次合并</button>
+            </div>
+          </div>
+
           <h3>版本历史</h3>
           <div class="scrollbox small">
             <table class="visit-table">
@@ -347,10 +417,19 @@ import {
 import { buildQueuePlayback, buildSegmentPlayback } from './playback'
 import { plainClone } from './plainClone'
 import { importPlanBundle, migrateLegacyProject, validateImportedPlan } from './projectMigration'
+import {
+  createProposal,
+  proposalDeleteQueueItem,
+  proposalReorderQueueItem,
+  proposalUpdateQueueItem
+} from './proposalService'
+import { exportProposal, importProposal } from './proposalExchange'
+import { applyMerge, resolveConflict, undoMerge, unresolvedConflicts } from './mergeService'
 
 const scoreContainer = ref<HTMLElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
 const planFileInput = ref<HTMLInputElement | null>(null)
+const proposalFileInput = ref<HTMLInputElement | null>(null)
 const display = shallowRef<DisplayHandle | null>(null)
 const audioContext = shallowRef<AudioContext | null>(null)
 const metronome = shallowRef<Metronome | null>(null)
@@ -394,6 +473,24 @@ const queueItemLoops = ref(1)
 const queueItemTempo = ref(1)
 const mismatchChoices = ref<Record<string, string>>({})
 
+const proposalName = ref('')
+const proposalAuthor = ref('')
+const activeProposalId = ref('')
+const proposalQueueId = ref('')
+const proposalItemId = ref('')
+const proposalItemLoops = ref(1)
+const proposalItemTempo = ref(1)
+
+watch([proposalItemId, activeProposalId, proposalQueueId], () => {
+  const proposal = project.value?.proposals?.find((item) => item.id === activeProposalId.value)
+  const item = proposal?.queues
+    .flatMap((queue) => queue.items)
+    .find((candidate) => candidate.id === proposalItemId.value)
+  if (!item) return
+  proposalItemLoops.value = item.loops
+  proposalItemTempo.value = item.tempoScale
+})
+
 const parsed = computed(() => (xml.value ? parseMusicXml(xml.value, currentFileName.value) : null))
 const path = computed(() =>
   parsed.value ? buildPerformancePath(parsed.value) : { visits: [], pulses: [], totalSeconds: 0, errors: [] }
@@ -407,6 +504,10 @@ const selectedVisit = computed(() =>
     : path.value.visits.find((v) => v.sequence === selectedVisitSequence.value) ?? null
 )
 const queues = computed<PartQueue[]>(() => plan.value?.queues ?? [])
+const proposalQueueItems = computed(() => {
+  const proposal = project.value?.proposals?.find((item) => item.id === activeProposalId.value)
+  return proposal?.queues.find((queue) => queue.id === proposalQueueId.value)?.items ?? []
+})
 const mismatches = computed(() => plan.value?.mismatches ?? [])
 const errorCount = computed(() => parsed.value?.diagnostics.filter((d) => d.level === 'error').length ?? 0)
 const levelText = { error: '错误', warning: '警告', info: '信息' } as const
@@ -659,24 +760,158 @@ async function onPlanImport(event: Event) {
   const file = input.files?.[0]
   if (!file) return
   try {
-    const parsedJson: unknown = JSON.parse(await file.text())
-    const valid = await validateImportedPlan(parsedJson)
-    if (!valid.ok) {
-      importMessage.value = valid.message
-      return
-    }
-    const result = await importPlanBundle(project.value ?? undefined, valid.bundle)
-    importMessage.value = result.message
-    if (result.project) {
-      await saveProject(result.project)
-      projects.value = await listProjects()
-      await openProject(result.project.id)
+    const text = await file.text()
+    const parsedJson: unknown = JSON.parse(text)
+    const isProposal = typeof parsedJson === 'object' && parsedJson !== null && (parsedJson as { schema?: string }).schema === 'rehearsal-stand-proposal/v1'
+    if (isProposal) {
+      await onProposalImportContent(parsedJson)
+      await nextTick()
+    } else {
+      const valid = await validateImportedPlan(parsedJson)
+      if (!valid.ok) {
+        importMessage.value = valid.message
+        return
+      }
+      const result = await importPlanBundle(project.value ?? undefined, valid.bundle)
+      importMessage.value = result.message
+      if (result.project) {
+        await saveProject(result.project)
+        projects.value = await listProjects()
+        await openProject(result.project.id)
+      }
     }
   } catch (error) {
     importMessage.value = `方案 JSON 无法解析：${error instanceof Error ? error.message : String(error)}`
   } finally {
     input.value = ''
   }
+}
+
+async function onProposalImportContent(content: unknown) {
+  if (!project.value) {
+    importMessage.value = '请先打开同乐谱工程。'
+    return
+  }
+  const result = await importProposal(project.value, content)
+  importMessage.value = result.message
+  const stored = plainClone(project.value)
+  await saveProject(stored)
+  project.value = stored
+  if (stored.plan) plan.value = plainClone(stored.plan)
+  projects.value = await listProjects()
+}
+
+async function createDraftProposal() {
+  if (!plan.value || !project.value) return
+  const draft = createProposal(plan.value, proposalName.value.trim(), proposalAuthor.value.trim())
+  project.value.proposals = project.value.proposals ?? []
+  project.value.proposals.push(draft)
+  const stored = plainClone(project.value)
+  await saveProject(stored)
+  project.value = stored
+  projects.value = await listProjects()
+  currentProjectId.value = stored.id
+  activeProposalId.value = draft.id
+  proposalQueueId.value = draft.queues[0]?.id ?? ''
+  await nextTick()
+  proposalName.value = ''
+}
+
+async function editActiveProposalItem() {
+  const proposal = project.value?.proposals?.find((item) => item.id === activeProposalId.value)
+  if (!proposal || !proposalQueueId.value || !proposalItemId.value) return
+  proposalUpdateQueueItem(proposal, proposalQueueId.value, proposalItemId.value, {
+    loops: proposalItemLoops.value,
+    tempoScale: proposalItemTempo.value
+  })
+  const stored = plainClone(project.value!)
+  await saveProject(stored)
+  project.value = stored
+  projects.value = await listProjects()
+}
+
+async function moveActiveProposalItem(direction: -1 | 1) {
+  const proposal = project.value?.proposals?.find((item) => item.id === activeProposalId.value)
+  if (!proposal) return
+  proposalReorderQueueItem(proposal, proposalQueueId.value, proposalItemId.value, direction)
+  const stored = plainClone(project.value!)
+  await saveProject(stored)
+  project.value = stored
+  projects.value = await listProjects()
+}
+
+async function deleteActiveProposalItem() {
+  const proposal = project.value?.proposals?.find((item) => item.id === activeProposalId.value)
+  if (!proposal) return
+  proposalDeleteQueueItem(proposal, proposalQueueId.value, proposalItemId.value)
+  proposalItemId.value = ''
+  const stored = plainClone(project.value!)
+  await saveProject(stored)
+  project.value = stored
+  projects.value = await listProjects()
+}
+
+async function exportActiveProposal(proposal: { id: string }) {
+  if (!parsed.value || !project.value) return
+  const full = project.value.proposals?.find((item) => item.id === proposal.id)
+  if (!full) return
+  await exportProposal(parsed.value.xml, full, parsed.value.title, currentFileName.value)
+}
+
+function proposalMergeStatus(proposalId: string): string {
+  const pending = project.value?.pendingMerges?.some((item) => item.proposal.id === proposalId)
+  if (pending) return '存在待处理冲突'
+  const merged = project.value?.mergeRecords?.some((item) => item.proposalId === proposalId && !item.undoneAt)
+  return merged ? '已合并' : '可导入/待合并'
+}
+
+function formatConflictValue(value: unknown): string {
+  if (value && typeof value === 'object' && 'visitKey' in value) return String((value as { visitKey: string }).visitKey)
+  if (Array.isArray(value)) return value.join(', ')
+  return String(value ?? '—')
+}
+
+function hasUnresolvedConflict(proposalId: string): boolean {
+  const pending = project.value?.pendingMerges?.find((item) => item.proposal.id === proposalId)
+  return !pending || unresolvedConflicts(pending).length > 0
+}
+
+function resolvePendingConflict(proposalId: string, conflictId: string, resolution: 'local' | 'proposal') {
+  const pending = project.value?.pendingMerges?.find((item) => item.proposal.id === proposalId)
+  if (!pending) return
+  resolveConflict(pending, conflictId, resolution)
+}
+
+async function applyPendingMerge(proposalId: string) {
+  if (!project.value?.plan) return
+  const pending = project.value.pendingMerges?.find((item) => item.proposal.id === proposalId)
+  if (!pending || unresolvedConflicts(pending).length) return
+  const result = await applyMerge(project.value.plan, pending.proposal, pending.conflicts)
+  if (!result.record) return
+  project.value.mergeRecords = project.value.mergeRecords ?? []
+  project.value.mergeRecords.push(result.record)
+  project.value.pendingMerges = (project.value.pendingMerges ?? []).filter((item) => item.proposal.id !== proposalId)
+  const proposal = project.value.proposals?.find((item) => item.id === proposalId)
+  if (proposal) proposal.status = 'merged'
+  plan.value = plainClone(project.value.plan)
+  await saveProject(project.value)
+}
+
+async function discardPendingMerge(proposalId: string) {
+  if (!project.value) return
+  const pending = project.value.pendingMerges?.find((item) => item.proposal.id === proposalId)
+  if (pending) pending.proposal.status = 'imported'
+  importMessage.value = '提案保留为历史，未应用。'
+  await saveProject(project.value)
+}
+
+async function undoRecord(recordId: string) {
+  if (!project.value?.plan) return
+  const record = project.value.mergeRecords?.find((item) => item.id === recordId)
+  if (!record) return
+  await undoMerge(project.value.plan, record)
+  plan.value = plainClone(project.value.plan)
+  await saveProject(project.value)
 }
 
 function visitsForWritten(index: number) {
@@ -775,7 +1010,14 @@ function queuePositionText(queue: PartQueue): string {
 async function playQueue(queue: PartQueue, restart = false) {
   if (!plan.value) return
   const summary = queueSummary(queue)
-  if (summary.blocked > 0 || summary.pending > 0) return
+  const pendingBlocked = new Set(
+    (project.value?.pendingMerges ?? []).flatMap((pending) =>
+      pending.conflicts
+        .filter((conflict) => conflict.entityType === 'queue-item')
+        .map((conflict) => conflict.entityId)
+    )
+  )
+  if (summary.blocked > 0 || summary.pending > 0 || queue.items.some((item) => pendingBlocked.has(item.id))) return
   const resume = restart || queue.position?.completed ? null : queue.position
   const playback = buildQueuePlayback(queue, path.value.visits, path.value.pulses, resume)
   if (!playback) return
