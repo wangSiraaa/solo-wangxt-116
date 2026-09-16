@@ -235,9 +235,15 @@
             <div class="muted">事件 {{ project?.ledger ? ledgerEventCount : 0 }} · 检查点 {{ project?.ledger ? ledgerCheckpointCount : 0 }} · 隔离 {{ ledgerValidation?.quarantined.length ?? 0 }}</div>
             <span v-if="ledgerValidation?.ok" class="badge ok">链校验通过</span>
             <span v-else-if="ledgerValidation" class="badge error">账本阻塞</span>
-            <ul v-if="ledgerValidation && !ledgerValidation.ok" class="ledger-errors">
+            <ul v-if="ledgerValidation && !ledgerValidation.ok" class="ledger-errors" data-testid="ledger-chain-errors">
               <li v-for="error in ledgerValidation.errors.slice(0, 5)" :key="error">{{ error }}</li>
             </ul>
+            <button
+              v-if="ledgerValidation && !ledgerValidation.ok && ledgerTrustedCount !== null && ledgerTrustedCount < ledgerEvents.length"
+              data-testid="ledger-reject-tail"
+              class="danger"
+              @click="rejectUntrustedTail"
+            >拒绝不可信后续事件并恢复可信链</button>
             <ul v-if="ledgerQuarantined.length" class="ledger-errors" data-testid="ledger-quarantine">
               <li v-for="item in ledgerQuarantined" :key="item.id">
                 隔离：{{ quarantineReasonText(item.reason) }} · {{ formatDate(item.at) }}
@@ -254,6 +260,30 @@
                 <li v-for="event in ledgerEvents.slice(-12)" :key="event.id">#{{ event.clock }} · {{ event.summary }}</li>
               </ul>
             </details>
+            <div class="checkpoint-replay" data-testid="checkpoint-replay">
+              <div class="muted">检查点只读回放</div>
+              <div class="row">
+                <select v-model="selectedCheckpointId" data-testid="checkpoint-select" style="flex:1">
+                  <option value="">选择检查点…</option>
+                  <option v-for="cp in replayableCheckpoints" :key="cp.id" :value="cp.id">
+                    #{{ cp.clock }} · {{ formatDate(cp.at) }}
+                  </option>
+                </select>
+                <button :disabled="!selectedCheckpointId" @click="previewCheckpoint">只读回放</button>
+                <button :disabled="!selectedCheckpointId" @click="downloadPracticeReport">练习报告</button>
+                <button v-if="checkpointPreview" @click="closeCheckpointPreview">关闭预览</button>
+              </div>
+              <div v-if="checkpointPreview" class="checkpoint-preview" data-testid="checkpoint-preview">
+                <span class="badge ok">只读状态 · 不改写活动方案</span>
+                <div class="muted">检查点 {{ checkpointPreview.checkpoint.id }} · 事件 {{ checkpointPreview.activeEvent.id }} · #{{ checkpointPreview.activeEvent.clock }}</div>
+                <ul class="op-list">
+                  <li v-for="queue in checkpointPreview.queues" :key="queue.id">
+                    队列 {{ queueLabel(queue.id) }} · 完成 {{ queue.completions.length }} ·
+                    {{ queue.position ? `当前 ${queue.position.measureQuarter + 1} 拍 / 循环 ${queue.position.loopIndex + 1}` : '无活动位置' }}
+                  </li>
+                </ul>
+              </div>
+            </div>
           </div>
 
           <h3>变更提案与三方合并</h3>
@@ -413,7 +443,7 @@ import { createDisplay, type DisplayHandle } from './display'
 import { Metronome } from './metronome'
 import { createSampleXml } from './sampleScore'
 import { createId, deleteProject, listProjects, saveProject } from './db'
-import { exportProjectArtifacts } from './exporter'
+import { downloadText, exportProjectArtifacts } from './exporter'
 import { sha256Text } from './crypto'
 import {
   addSegment as addPlanSegment,
@@ -453,11 +483,17 @@ import { exportProposal, importProposal } from './proposalExchange'
 import { applyMerge, resolveConflict, undoMerge, unresolvedConflicts } from './mergeService'
 import {
   appendLedgerEvent,
+  buildPracticeReport,
   createCheckpoint,
   createLedger,
   importLedgerEvents,
+  listReplayableCheckpoints,
   migrateSnapshotToLedger,
+  rejectUntrustedEvents,
+  replayCheckpoint,
   replayLedger,
+  trustedPrefixLength,
+  type CheckpointReplayState,
   type EventLedger,
   type LedgerValidation
 } from './ledgerService'
@@ -553,6 +589,35 @@ const ledgerEvents = computed(() => ((project.value?.ledger as EventLedger | und
 const ledgerEventCount = computed(() => ledgerEvents.value.length)
 const ledgerCheckpointCount = computed(() => ((project.value?.ledger as EventLedger | undefined)?.checkpoints ?? []).length)
 const ledgerQuarantined = computed(() => ((project.value?.ledger as EventLedger | undefined)?.quarantined ?? []))
+const replayableCheckpoints = computed(() => {
+  const ledger = project.value?.ledger as EventLedger | undefined
+  return ledger ? listReplayableCheckpoints(ledger) : []
+})
+const selectedCheckpointId = ref('')
+const checkpointPreview = ref<CheckpointReplayState | null>(null)
+function queueLabel(queueId: string): string {
+  return plan.value?.queues.find((queue) => queue.id === queueId)?.name ?? queueId.slice(0, 6)
+}
+function previewCheckpoint() {
+  const ledger = ledgerFromProject()
+  if (!ledger || !plan.value || !selectedCheckpointId.value) return
+  checkpointPreview.value = replayCheckpoint(plan.value, ledger, selectedCheckpointId.value)
+}
+function closeCheckpointPreview() {
+  checkpointPreview.value = null
+}
+async function downloadPracticeReport() {
+  const ledger = ledgerFromProject()
+  if (!ledger || !plan.value || !selectedCheckpointId.value || !parsed.value) return
+  const report = await buildPracticeReport(plan.value, ledger, selectedCheckpointId.value)
+  if (!report) return
+  const safe = (parsed.value.title || 'score').replace(/[^\p{L}\p{N}-]+/gu, '_')
+  await downloadText(
+    `${safe}.practice-report.json`,
+    JSON.stringify(report, null, 2),
+    'application/json'
+  )
+}
 function quarantineReasonText(reason: string): string {
   return {
     'same-id-different-content': '同 ID 不同内容',
@@ -569,9 +634,23 @@ async function resolveQuarantine(itemId: string, resolution: 'historical' | 'for
   if (!item) return
   item.resolution = resolution
   if (resolution === 'fork') item.forkId = createId()
-  ledgerValidation.value = await replayLedger(plan.value, ledger)
+  await runLedgerValidation(ledger)
   await persistProject()
 }
+const ledgerTrustedCount = ref<number | null>(null)
+async function rejectUntrustedTail() {
+  const ledger = ledgerFromProject()
+  if (!ledger || !plan.value) return
+  await rejectUntrustedEvents(ledger)
+  await runLedgerValidation(ledger)
+  await persistProject()
+}
+async function runLedgerValidation(ledger: EventLedger) {
+  if (!plan.value) return
+  ledgerValidation.value = await replayLedger(plan.value, ledger)
+  ledgerTrustedCount.value = await trustedPrefixLength(ledger)
+}
+
 const proposalQueueItems = computed(() => {
   const proposal = project.value?.proposals?.find((item) => item.id === activeProposalId.value)
   return proposal?.queues.find((queue) => queue.id === proposalQueueId.value)?.items ?? []
@@ -769,7 +848,7 @@ async function openProject(id: string) {
     }
     const ledger = ledgerFromProject()
     if (ledger) {
-      ledgerValidation.value = await replayLedger(plan.value, ledger)
+      await runLedgerValidation(ledger)
       stored.ledger = ledger
       stored.plan = plainClone(plan.value)
       project.value = stored
@@ -836,8 +915,13 @@ async function removeCurrent() {
 }
 
 async function exportData() {
-  if (!parsed.value || !plan.value) return
-  await exportProjectArtifacts(parsed.value.xml, markers.value, plan.value, project.value?.ledger ?? null, parsed.value.title, currentFileName.value)
+  if (!parsed.value || !plan.value || !project.value) return
+  if (!project.value.ledger) {
+    const ledger = await migrateSnapshotToLedger(plan.value, project.value)
+    project.value.ledger = ledger
+    await persistProject()
+  }
+  await exportProjectArtifacts(parsed.value.xml, markers.value, plan.value, project.value.ledger ?? null, parsed.value.title, currentFileName.value)
 }
 
 async function onPlanImport(event: Event) {
@@ -904,7 +988,7 @@ async function onLedgerImportContent(content: unknown) {
     return
   }
   const result = importLedgerEvents(project.value.ledger as EventLedger, bundle.ledger)
-  ledgerValidation.value = await replayLedger(plan.value, project.value.ledger as EventLedger)
+  await runLedgerValidation(project.value.ledger as EventLedger)
   await persistProject()
   importMessage.value = result.blocked
     ? `账本导入：${result.applied} 条应用，${result.duplicated} 条重复，${result.quarantined.length} 条隔离并阻塞播放。`

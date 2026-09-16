@@ -168,8 +168,23 @@ export async function validateLedger(ledger: EventLedger, expectedXmlSha256: str
     }
     if (!errors.some((error) => error.includes(event.id))) lastTrusted = event
   }
-  if (ledger.quarantined.length) errors.push(`存在 ${ledger.quarantined.length} 条隔离事件`)
+  const unresolved = ledger.quarantined.filter((item) => !item.resolution)
+  const nonPlayable = ledger.quarantined.filter((item) => item.resolution === 'historical' || item.resolution === 'fork')
+  if (unresolved.length) errors.push(`存在 ${unresolved.length} 条未决隔离事件`)
+  if (nonPlayable.length) errors.push(`存在 ${nonPlayable.length} 条历史/分叉隔离记录，不可作为可播放链`)
   return { ok: errors.length === 0, errors, lastTrustedEvent: lastTrusted, quarantined: ledger.quarantined }
+}
+
+/**
+ * Active-chain block rules:
+ * - unresolved quarantine blocks
+ * - historical/fork records are audit-only and never part of the playable chain (block)
+ * - rejected records keep their audit trail but unblock the active chain
+ */
+export function hasBlockingQuarantine(ledger: EventLedger): boolean {
+  return ledger.quarantined.some(
+    (item) => !item.resolution || item.resolution === 'historical' || item.resolution === 'fork'
+  )
 }
 
 export async function appendLedgerEvent(input: {
@@ -426,4 +441,184 @@ export function importLedgerEvents(target: EventLedger, incoming: EventLedger): 
 
 export function isLedgerBundle(value: unknown): value is { schema: string; ledger: EventLedger } {
   return !!value && typeof value === 'object' && (value as { schema?: string }).schema === 'rehearsal-stand-ledger/v1'
+}
+
+export interface CheckpointReplayState {
+  checkpoint: LedgerCheckpoint
+  queues: Array<{
+    id: string
+    position: QueuePosition | null
+    completions: QueueCompletion[]
+    completedAllAt?: number
+  }>
+  activeEvent: LedgerEvent
+}
+
+export interface PracticeReport {
+  schema: 'rehearsal-practice-report/v1'
+  checkpointId: string
+  eventId: string
+  eventHash: string
+  clock: number
+  xmlSha256: string
+  pathChecksum: string
+  planVersion: number
+  generatedAt: number
+  stateHash: string
+  queues: CheckpointReplayState['queues']
+}
+
+function applyEventToState(
+  event: LedgerEvent,
+  state: LedgerRuntimeState
+): void {
+  const queueId = event.after && typeof event.after === 'object' && 'queueId' in (event.after as object)
+    ? String((event.after as { queueId?: string }).queueId ?? event.entityId)
+    : event.entityId
+  const queueState = queueId ? state.byQueue.get(queueId) : undefined
+  if (!queueState) return
+
+  if (event.type === 'queue.item-complete' || event.type === 'queue.finished') {
+    const completion = (event.after as { completion?: QueueCompletion }).completion
+    const nextPosition = (event.after as { position?: QueuePosition | null }).position
+    const completedAt = (event.after as { completedAllAt?: number }).completedAllAt
+    if (completion && !queueState.completions.some((item) => item.id === completion.id || (item.runId === completion.runId && item.itemId === completion.itemId))) {
+      queueState.completions.push(plainClone(completion))
+    }
+    if (nextPosition) queueState.position = plainClone(nextPosition)
+    if (completedAt) queueState.completedAllAt = completedAt
+  }
+  if (event.type === 'queue.pause' || event.type === 'queue.run-start') {
+    const position = (event.after as { position?: QueuePosition | null }).position
+    queueState.position = position ? plainClone(position) : null
+  }
+}
+
+/**
+ * Read-only replay up to (and including) a checkpoint. Does NOT mutate the plan or
+ * active queues. Returns cursor, beat/loop boundaries and per-queue completion history.
+ */
+export function replayCheckpoint(
+  plan: RehearsalPlan,
+  ledger: EventLedger,
+  checkpointId: string
+): CheckpointReplayState | null {
+  const checkpoint = ledger.checkpoints.find((item) => item.id === checkpointId)
+  if (!checkpoint) return null
+  const activeEvent = ledger.events.find((event) => event.id === checkpoint.eventId)
+  if (!activeEvent) return null
+
+  const state = emptyRuntime(plan)
+  for (const event of ledger.events) {
+    if (event.clock > checkpoint.clock) break
+    applyEventToState(event, state)
+  }
+
+  const queues = plan.queues.map((queue) => {
+    const restored = state.byQueue.get(queue.id)
+    return {
+      id: queue.id,
+      position: restored ? plainClone(restored.position) : null,
+      completions: restored ? plainClone(restored.completions) : [],
+      completedAllAt: restored?.completedAllAt
+    }
+  })
+
+  return { checkpoint, queues, activeEvent }
+}
+
+export function listReplayableCheckpoints(ledger: EventLedger): LedgerCheckpoint[] {
+  return [...ledger.checkpoints].sort((a, b) => a.clock - b.clock)
+}
+
+export async function buildPracticeReport(
+  plan: RehearsalPlan,
+  ledger: EventLedger,
+  checkpointId: string
+): Promise<PracticeReport | null> {
+  const replay = replayCheckpoint(plan, ledger, checkpointId)
+  if (!replay) return null
+  const stateHash = await sha256Text(JSON.stringify({
+    checkpointId: replay.checkpoint.id,
+    eventId: replay.activeEvent.id,
+    queues: replay.queues.map((queue) => ({
+      id: queue.id,
+      position: queue.position,
+      completedAllAt: queue.completedAllAt,
+      completions: queue.completions.map((completion) => completion.id)
+    }))
+  }))
+  return {
+    schema: 'rehearsal-practice-report/v1',
+    checkpointId: replay.checkpoint.id,
+    eventId: replay.checkpoint.eventId,
+    eventHash: replay.checkpoint.eventHash,
+    clock: replay.checkpoint.clock,
+    xmlSha256: replay.checkpoint.xmlSha256,
+    pathChecksum: replay.checkpoint.pathChecksum,
+    planVersion: replay.checkpoint.planVersion,
+    generatedAt: Date.now(),
+    stateHash,
+    queues: replay.queues
+  }
+}
+
+/** Verify a previously exported practice report against the current ledger/plan. */
+export async function verifyPracticeReport(
+  plan: RehearsalPlan,
+  ledger: EventLedger,
+  report: PracticeReport
+): Promise<boolean> {
+  const replay = replayCheckpoint(plan, ledger, report.checkpointId)
+  if (!replay) return false
+  if (replay.checkpoint.eventHash !== report.eventHash) return false
+  if (replay.checkpoint.xmlSha256 !== report.xmlSha256) return false
+  if (replay.checkpoint.pathChecksum !== report.pathChecksum) return false
+  const rebuilt = await buildPracticeReport(plan, ledger, report.checkpointId)
+  return rebuilt?.stateHash === report.stateHash
+}
+
+/**
+ * Number of structurally valid events from genesis before the first broken link/hash.
+ * Returns null when the ledger is empty.
+ */
+export async function trustedPrefixLength(ledger: EventLedger): Promise<number> {
+  for (let index = 0; index < ledger.events.length; index += 1) {
+    const event = ledger.events[index]
+    const previous = index === 0 ? undefined : ledger.events[index - 1]
+    const { hash: _ignored, ...withoutHash } = event
+    void _ignored
+    const expectedHash = await hashEventContent(withoutHash)
+    const structuralOk =
+      (index === 0 ? event.id === GENESIS_ID : event.parentHash === previous?.hash) &&
+      event.hash === expectedHash &&
+      (index === 0 || event.clock === (previous?.clock ?? -1) + 1)
+    if (!structuralOk) return index
+  }
+  return ledger.events.length
+}
+
+/**
+ * Move every event after the trusted prefix into quarantine as "rejected" audit
+ * records, then return the truncated ledger. Rejected records keep their audit
+ * trail but never participate in the playable chain.
+ */
+export async function rejectUntrustedEvents(ledger: EventLedger): Promise<EventLedger> {
+  const trustedCount = await trustedPrefixLength(ledger)
+  const untrusted = ledger.events.splice(trustedCount)
+  for (const event of untrusted) {
+    const existing = ledger.quarantined.find((item) => item.event?.id === event.id || (item.raw as LedgerEvent | undefined)?.id === event.id)
+    if (existing) {
+      existing.resolution = 'rejected'
+      continue
+    }
+    ledger.quarantined.push({
+      id: createId(),
+      event: plainClone(event),
+      reason: 'broken-hash',
+      at: Date.now(),
+      resolution: 'rejected'
+    })
+  }
+  return ledger
 }

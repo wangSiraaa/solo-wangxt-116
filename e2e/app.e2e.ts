@@ -153,7 +153,7 @@ test('分部队列：独立速度/循环、刷新恢复、队列顺序隔离、�
   const beforeVersion = await page.locator('.plan-header .pill').first().textContent()
   await page.getByRole('button', { name: '保存/更新工程' }).click()
   await expect(page.locator('.plan-header .pill').first()).toHaveText(beforeVersion ?? '')
-  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click())
+  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click(), 4)
   const planFile = downloaded.bySuffix('rehearsal-plan.json')!
   const planBundle = JSON.parse(planFile.content)
   expect(planBundle.plan.queues).toHaveLength(2)
@@ -215,7 +215,7 @@ test('未知 note 子元素：诊断可见、原 XML 持久化、导出不丢符
   const projects = (await readProjects(page)) as Array<{ title: string; xml: string }>
   expect(projects.find((item) => item.title === 'E2E 未知 note 子元素')?.xml).toContain('rehearsal:alien-articulation')
   await page.getByRole('button', { name: '排练方案', exact: true }).click()
-  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click())
+  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click(), 4)
   const files = downloaded.results
   expect(downloaded.bySuffix('.musicxml')?.content).toContain('do-not-drop')
 })
@@ -244,7 +244,7 @@ test('旧版仅含标记工程自动迁移：补齐默认方案，标记/XML/未
 
   await page.getByRole('button', { name: '标记', exact: true }).click()
   await expect(page.getByText('旧版标记必须保留')).toBeVisible()
-  const downloads = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click())
+  const downloads = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click(), 4)
   const files = downloads.results
   expect(files.map((file) => file.filename)).toEqual(
     expect.arrayContaining([
@@ -344,7 +344,7 @@ test('三项队列逐项完成、刷新恢复、完整播放后历史不重复',
   await page.getByRole('button', { name: '排练方案', exact: true }).click()
   const reopenedQueue = page.getByTestId('queue-card').first()
   await expect(reopenedQueue).toContainText('队列已完成')
-  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click())
+  const downloaded = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click(), 4)
   const planFile = downloaded.bySuffix('rehearsal-plan.json')!
   await page.evaluate(async (content) => {
     const file = new File([content], 'plan.json', { type: 'application/json' })
@@ -609,4 +609,106 @@ test('账本：重复和乱序导入幂等，不产生重复完成记录', async
   }>
   expect(projects.at(-1)?.plan?.queues?.[0]?.completions).toHaveLength(3)
   await expect(queue).toContainText('队列已完成')
+})
+
+test('检查点：只读回放不改写活动队列，练习报告摘要可校验', async ({ page }) => {
+  const queue = await setupThreeItemRun(page)
+  // Wait until at least two checkpoints exist (each item boundary creates one).
+  await expect.poll(async () => {
+    const projects = (await readProjects(page)) as Array<{
+      ledger?: { checkpoints?: unknown[] }
+    }>
+    return projects.at(-1)?.ledger?.checkpoints?.length ?? 0
+  }, { timeout: 20_000 }).toBeGreaterThanOrEqual(2)
+
+  const before = (await readProjects(page)) as Array<{
+    plan?: { queues?: Array<{ position?: unknown; completions?: unknown[] }> }
+  }>
+  const activeBefore = JSON.stringify(before.at(-1)?.plan?.queues?.[0])
+
+  await page.getByTestId('checkpoint-select').selectOption({ index: 1 })
+  await page.getByRole('button', { name: '只读回放', exact: true }).click()
+  await expect(page.getByTestId('checkpoint-preview')).toContainText('只读状态')
+  await expect(page.getByTestId('checkpoint-preview')).toContainText('完成 0')
+
+  // Active queue must remain untouched (still fully completed).
+  const after = (await readProjects(page)) as Array<{
+    plan?: { queues?: Array<{ position?: unknown; completions?: unknown[] }> }
+  }>
+  expect(JSON.stringify(after.at(-1)?.plan?.queues?.[0])).toBe(activeBefore)
+  await expect(queue).toContainText('队列已完成')
+
+  // Download verifiable practice report and assert its identity fields.
+  const reportDownload = await collectDownloads(
+    page,
+    () => page.getByRole('button', { name: '练习报告' }).click(),
+    1
+  )
+  const report = JSON.parse(reportDownload.results[0].content) as {
+    schema: string
+    checkpointId: string
+    eventHash: string
+    xmlSha256: string
+    pathChecksum: string
+    stateHash: string
+    queues: unknown[]
+  }
+  expect(report.schema).toBe('rehearsal-practice-report/v1')
+  expect(report.eventHash).toMatch(/^[a-f0-9]{16,}$/)
+  expect(report.xmlSha256).toMatch(/^[a-f0-9]{16,}$/)
+  expect(report.pathChecksum).toMatch(/^[a-f0-9]{8,}$/)
+  expect(report.stateHash).toMatch(/^[a-f0-9]{16,}$/)
+  expect(report.queues.length).toBeGreaterThan(0)
+})
+
+test('隔离：逐项拒绝后解除活动链阻塞但保留审计，历史/分叉不可播放', async ({ page }) => {
+  await setupThreeItemRun(page)
+  // Tamper a ledger event so it lands in quarantine and blocks playback.
+  await page.evaluate(() => {
+    return new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open('rehearsal-stand')
+      open.onsuccess = () => {
+        const db = open.result
+        const tx = db.transaction('projects', 'readwrite')
+        const get = tx.objectStore('projects').getAll()
+        get.onsuccess = () => {
+          const project = get.result.at(-1)
+          const target = project.ledger.events.find((event: { type: string }) => event.type === 'queue.item-complete')
+          target.summary = '被篡改'
+          tx.objectStore('projects').put(project)
+        }
+        tx.oncomplete = () => { db.close(); resolve() }
+        tx.onerror = () => reject(tx.error)
+      }
+    })
+  })
+  await page.reload()
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  await expect(page.getByTestId('ledger-panel')).toContainText('账本阻塞')
+  const play = page.getByTestId('queue-card').first().getByTestId('queue-play')
+  await expect(play).toBeDisabled()
+  await expect(page.getByTestId('ledger-chain-errors')).toBeVisible()
+  await expect(page.getByTestId('ledger-reject-tail')).toBeVisible()
+
+  // Reject untrusted tail: audit remains as rejected, active chain unblocks.
+  await page.getByTestId('ledger-reject-tail').click()
+  await expect(page.getByTestId('ledger-panel')).toContainText('链校验通过')
+  // Audit record is retained with rejected resolution.
+  const resolved = await page.evaluate(() => {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open('rehearsal-stand')
+      open.onsuccess = () => {
+        const db = open.result
+        const tx = db.transaction('projects', 'readonly')
+        const get = tx.objectStore('projects').getAll()
+        get.onsuccess = () => {
+          const project = get.result.at(-1)
+          resolve(project.ledger.quarantined.map((item: { resolution?: string }) => item.resolution))
+        }
+        tx.onerror = () => reject(tx.error)
+      }
+    })
+  })
+  expect(resolved).toContain('rejected')
+  await expect(play).toBeEnabled()
 })
