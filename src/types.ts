@@ -444,9 +444,25 @@ export interface StoredProject {
   pendingMerges?: PendingMerge[]
   mergeRecords?: MergeRecord[]
   plan?: RehearsalPlan | null
-  schemaVersion?: 1 | 2
+  ledger?: unknown
+  ledgerMigration?: {
+    migratedAt: number
+    fromSchemaVersion: number
+    ledgerVersion: number
+    source: string
+  }
+  schemaVersion?: 1 | 2 | 3
   updatedAt: number
   createdAt: number
+}
+
+export interface LedgerExportBundle {
+  schema: 'rehearsal-stand-ledger/v1'
+  title: string
+  sourceFileName: string
+  xmlSha256: string
+  exportedAt: number
+  ledger: unknown
 }
 
 export interface MarkerExportBundle {
@@ -476,4 +492,4 @@ export interface ProposalExportBundle {
   proposal: RehearsalChangeProposal
 }
 
-export type ExportBundle = MarkerExportBundle | PlanExportBundle | ProposalExportBundle
+export type ExportBundle = MarkerExportBundle | PlanExportBundle | ProposalExportBundle | LedgerExportBundle

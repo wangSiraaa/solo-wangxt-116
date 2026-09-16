@@ -1,5 +1,5 @@
 import { sha256Text } from './crypto'
-import type { MarkerExportBundle, PlanExportBundle, RehearsalMarker, RehearsalPlan } from './types'
+import type { LedgerExportBundle, MarkerExportBundle, PlanExportBundle, RehearsalMarker, RehearsalPlan } from './types'
 
 export async function downloadText(filename: string, text: string, mime: string): Promise<void> {
   const blob = new Blob([text], { type: `${mime};charset=utf-8` })
@@ -19,6 +19,7 @@ export async function exportProjectArtifacts(
   xml: string,
   markers: RehearsalMarker[],
   plan: RehearsalPlan | null,
+  ledger: unknown = null,
   title: string,
   sourceFileName: string
 ): Promise<void> {
@@ -48,6 +49,18 @@ export async function exportProjectArtifacts(
     }
     await sleep()
     await downloadText(`${safe}.rehearsal-plan.json`, JSON.stringify(planBundle, null, 2), 'application/json')
+    if (ledger) {
+      await sleep()
+      const ledgerBundle: LedgerExportBundle = {
+        schema: 'rehearsal-stand-ledger/v1',
+        title,
+        sourceFileName,
+        xmlSha256,
+        exportedAt: Date.now(),
+        ledger: ledger as Record<string, unknown>
+      }
+      await downloadText(`${safe}.rehearsal-ledger.json`, JSON.stringify(ledgerBundle, null, 2), 'application/json')
+    }
   }
 }
 

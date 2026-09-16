@@ -529,3 +529,84 @@ test('变更提案：共享队列项同字段冲突可逐项决议，刷新保�
   await undo.click()
   await expect(page.getByTestId('undo-merge')).toHaveCount(0)
 })
+
+async function setupThreeItemRun(page: Page) {
+  await installAudioProbe(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  async function makeSegment(name: string, visitOption: number) {
+    await page.getByTestId('segment-name').fill(name)
+    await page.getByTestId('segment-start').selectOption({ index: visitOption })
+    await page.getByTestId('segment-end').selectOption({ index: visitOption })
+    await page.getByTestId('save-segment').click()
+  }
+  await makeSegment('短段一', 2)
+  await makeSegment('短段二', 3)
+  await makeSegment('短段三', 4)
+  await page.getByTestId('queue-name').fill('长笛')
+  await page.getByTestId('add-queue').click()
+  const queue = page.getByTestId('queue-card').first()
+  for (const name of ['短段一', '短段二', '短段三']) {
+    await queue.locator('select').last().selectOption({ label: name })
+    await queue.getByRole('button', { name: '加入' }).click()
+  }
+  await queue.getByTestId('queue-play').click()
+  await expect(queue).toContainText('队列已完成')
+  return queue
+}
+
+test('账本：篡改事件/缺失父链阻塞播放，不按书面小节猜测', async ({ page }) => {
+  await setupThreeItemRun(page)
+  // Tamper a ledger event payload directly in IndexedDB.
+  await page.evaluate(() => {
+    return new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open('rehearsal-stand')
+      open.onsuccess = () => {
+        const db = open.result
+        const tx = db.transaction('projects', 'readwrite')
+        const get = tx.objectStore('projects').getAll()
+        get.onsuccess = () => {
+          const project = get.result.at(-1)
+          const ledger = project.ledger
+          const target = ledger.events.find((event: { type: string }) => event.type === 'queue.item-complete')
+          target.summary = '被篡改'
+          tx.objectStore('projects').put(project)
+        }
+        tx.oncomplete = () => { db.close(); resolve() }
+        tx.onerror = () => reject(tx.error)
+      }
+    })
+  })
+  await page.reload()
+  await page.getByRole('button', { name: '排练方案', exact: true }).click()
+  await expect(page.getByTestId('ledger-panel')).toContainText('账本阻塞')
+  const play = page.getByTestId('queue-card').first().getByTestId('queue-play')
+  await expect(play).toBeDisabled()
+})
+
+test('账本：重复和乱序导入幂等，不产生重复完成记录', async ({ page }) => {
+  const queue = await setupThreeItemRun(page)
+  const exported = await collectDownloads(page, () => page.getByRole('button', { name: '导出 XML+标记+方案' }).click(), 4)
+  const ledgerFile = exported.bySuffix('rehearsal-ledger.json')!
+  const bundle = JSON.parse(ledgerFile.content) as {
+    ledger: { events: Array<Record<string, unknown>> }
+  }
+  // Shuffle non-genesis events to create out-of-order payload; causal fold should apply 0
+  // because the target ledger already contains them (duplicate by id).
+  const shuffled = JSON.parse(JSON.stringify(bundle))
+  shuffled.ledger.events = [...bundle.ledger.events].reverse()
+  await page.evaluate((text) => {
+    const file = new File([text], 'ledger.json', { type: 'application/json' })
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    const input = document.querySelector<HTMLInputElement>('input[data-testid="plan-file"]')!
+    input.files = dt.files
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  }, JSON.stringify(shuffled))
+  await page.waitForTimeout(400)
+  const projects = (await readProjects(page)) as Array<{
+    plan?: { queues?: Array<{ completions: unknown[] }> }
+  }>
+  expect(projects.at(-1)?.plan?.queues?.[0]?.completions).toHaveLength(3)
+  await expect(queue).toContainText('队列已完成')
+})

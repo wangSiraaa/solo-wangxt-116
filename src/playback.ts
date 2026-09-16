@@ -182,7 +182,8 @@ export function buildQueuePlayback(
         bpm: Math.round(pulse.bpm * item.tempoScale)
       })
     }
-    const last = visits[visits.length - 1]
+    const itemVisits = visits.slice(offset)
+    const last = itemVisits[itemVisits.length - 1]
     if (last) {
       last.queueItemEnd = true
       last.queueItemId = item.id

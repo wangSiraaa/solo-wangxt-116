@@ -73,6 +73,10 @@ export class Metronome {
   }
 
   stop(notify = true, completed = false) {
+    if (completed) {
+      const lastVisit = this.visits[this.visits.length - 1]
+      if (lastVisit?.queueItemEnd) this.onVisitEnd?.(lastVisit)
+    }
     if (this.timer !== null) {
       clearInterval(this.timer)
       this.timer = null
@@ -131,8 +135,9 @@ export class Metronome {
       const finalTime = lastVisit
         ? lastVisit.startTime + lastVisit.durationSeconds
         : lastPulse.time
-      const endAt = this.startAudioTime + ((finalTime - this.startPerformanceTime) / this.rate) + 0.1 / this.rate
-      this.stopTimer = window.setTimeout(() => this.stop(true, true), Math.max(0, (endAt - this.audio.currentTime) * 1000))
+      const completeAt = this.startAudioTime + ((finalTime - this.startPerformanceTime) / this.rate)
+      const completeDelay = Math.max(0, (completeAt - this.audio.currentTime) * 1000)
+      this.stopTimer = window.setTimeout(() => this.stop(true, true), completeDelay)
     }
   }
 

@@ -203,7 +203,7 @@
             <button
               class="primary"
               data-testid="queue-play"
-              :disabled="queueSummary(queue).blocked > 0"
+              :disabled="queueSummary(queue).blocked > 0 || ledgerValidation?.ok === false"
               @click="playQueue(queue)"
             >
               {{ queuePositionText(queue).includes('已完成队列') ? '重新播放整个队列' : '按队列顺序恢复播放' }}
@@ -228,6 +228,32 @@
               </button>
               <button :disabled="!session.position || session.position.completed" @click="resetSessionProgress(session)">重置进度</button>
             </div>
+          </div>
+
+          <h3>可验证事件账本</h3>
+          <div class="ledger-panel" data-testid="ledger-panel">
+            <div class="muted">事件 {{ project?.ledger ? ledgerEventCount : 0 }} · 检查点 {{ project?.ledger ? ledgerCheckpointCount : 0 }} · 隔离 {{ ledgerValidation?.quarantined.length ?? 0 }}</div>
+            <span v-if="ledgerValidation?.ok" class="badge ok">链校验通过</span>
+            <span v-else-if="ledgerValidation" class="badge error">账本阻塞</span>
+            <ul v-if="ledgerValidation && !ledgerValidation.ok" class="ledger-errors">
+              <li v-for="error in ledgerValidation.errors.slice(0, 5)" :key="error">{{ error }}</li>
+            </ul>
+            <ul v-if="ledgerQuarantined.length" class="ledger-errors" data-testid="ledger-quarantine">
+              <li v-for="item in ledgerQuarantined" :key="item.id">
+                隔离：{{ quarantineReasonText(item.reason) }} · {{ formatDate(item.at) }}
+                <div class="row">
+                  <button @click="resolveQuarantine(item.id, 'historical')">保留历史</button>
+                  <button @click="resolveQuarantine(item.id, 'fork')">分叉为只读审计线</button>
+                  <button class="danger" @click="resolveQuarantine(item.id, 'rejected')">拒绝</button>
+                </div>
+              </li>
+            </ul>
+            <details>
+              <summary>事件时间线</summary>
+              <ul class="op-list">
+                <li v-for="event in ledgerEvents.slice(-12)" :key="event.id">#{{ event.clock }} · {{ event.summary }}</li>
+              </ul>
+            </details>
           </div>
 
           <h3>变更提案与三方合并</h3>
@@ -425,6 +451,24 @@ import {
 } from './proposalService'
 import { exportProposal, importProposal } from './proposalExchange'
 import { applyMerge, resolveConflict, undoMerge, unresolvedConflicts } from './mergeService'
+import {
+  appendLedgerEvent,
+  createCheckpoint,
+  createLedger,
+  importLedgerEvents,
+  migrateSnapshotToLedger,
+  replayLedger,
+  type EventLedger,
+  type LedgerValidation
+} from './ledgerService'
+function ledgerFromProject(): EventLedger | null {
+  return (project.value?.ledger as EventLedger | undefined) ?? null
+}
+async function appendProjectLedgerEvent(input: Omit<Parameters<typeof appendLedgerEvent>[0], 'ledger'>): Promise<void> {
+  const ledger = ledgerFromProject()
+  if (!ledger || !plan.value) return
+  await appendLedgerEvent({ ...input, ledger })
+}
 
 const scoreContainer = ref<HTMLElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -472,6 +516,7 @@ const queueItemSegmentId = ref('')
 const queueItemLoops = ref(1)
 const queueItemTempo = ref(1)
 const mismatchChoices = ref<Record<string, string>>({})
+const ledgerValidation = ref<LedgerValidation | null>(null)
 
 const proposalName = ref('')
 const proposalAuthor = ref('')
@@ -504,6 +549,29 @@ const selectedVisit = computed(() =>
     : path.value.visits.find((v) => v.sequence === selectedVisitSequence.value) ?? null
 )
 const queues = computed<PartQueue[]>(() => plan.value?.queues ?? [])
+const ledgerEvents = computed(() => ((project.value?.ledger as EventLedger | undefined)?.events ?? []))
+const ledgerEventCount = computed(() => ledgerEvents.value.length)
+const ledgerCheckpointCount = computed(() => ((project.value?.ledger as EventLedger | undefined)?.checkpoints ?? []).length)
+const ledgerQuarantined = computed(() => ((project.value?.ledger as EventLedger | undefined)?.quarantined ?? []))
+function quarantineReasonText(reason: string): string {
+  return {
+    'same-id-different-content': '同 ID 不同内容',
+    'missing-parent': '父链缺失/不可达',
+    'broken-hash': '哈希损坏',
+    'summary-mismatch': 'XML/路径摘要不符',
+    unknown: '未知错误'
+  }[reason as 'missing-parent'] ?? reason
+}
+async function resolveQuarantine(itemId: string, resolution: 'historical' | 'fork' | 'rejected') {
+  const ledger = ledgerFromProject()
+  if (!ledger || !plan.value) return
+  const item = ledger.quarantined.find((entry) => entry.id === itemId)
+  if (!item) return
+  item.resolution = resolution
+  if (resolution === 'fork') item.forkId = createId()
+  ledgerValidation.value = await replayLedger(plan.value, ledger)
+  await persistProject()
+}
 const proposalQueueItems = computed(() => {
   const proposal = project.value?.proposals?.find((item) => item.id === activeProposalId.value)
   return proposal?.queues.find((queue) => queue.id === proposalQueueId.value)?.items ?? []
@@ -518,7 +586,7 @@ const subjectText: Record<PlanMismatch['subject'], string> = {
   'queue-item': '分部队列段落',
   'queue-position': '分部队列恢复位置'
 }
-const canPlayFullPath = computed(() => path.value.visits.length > 0 && !path.value.errors.length && !mismatches.value.length)
+const canPlayFullPath = computed(() => path.value.visits.length > 0 && !path.value.errors.length && !mismatches.value.length && ledgerValidation.value?.ok !== false)
 const canAddSegment = computed(() =>
   !!plan.value &&
   !!newSegmentStartKey.value &&
@@ -693,6 +761,21 @@ async function openProject(id: string) {
   if (stored.plan) {
     plan.value = plainClone(stored.plan)
     if (await ensurePlanQueues(plan.value)) await persistProject()
+    if (!stored.ledger) {
+      const ledger = await migrateSnapshotToLedger(plan.value, stored)
+      stored.ledger = ledger
+      project.value = stored
+      await persistProject()
+    }
+    const ledger = ledgerFromProject()
+    if (ledger) {
+      ledgerValidation.value = await replayLedger(plan.value, ledger)
+      stored.ledger = ledger
+      stored.plan = plainClone(plan.value)
+      project.value = stored
+      await saveProject(plainClone(stored))
+      projects.value = await listProjects()
+    }
   } else {
     const performancePath = buildPerformancePath(parseMusicXml(stored.xml, stored.fileName))
     const migrated = await createPlan('从旧标记工程迁移的默认方案', performancePath, xmlHash.value, {
@@ -723,7 +806,9 @@ async function persistProject() {
     xmlSha256: xmlHash.value,
     markers: markers.value.map((marker) => ({ ...marker })),
     plan: plan.value,
-    schemaVersion: 2 as const,
+    ledger: (project.value?.ledger as EventLedger | undefined) ?? null,
+    ledgerMigration: project.value?.ledgerMigration,
+    schemaVersion: 3 as const,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now
   })
@@ -752,7 +837,7 @@ async function removeCurrent() {
 
 async function exportData() {
   if (!parsed.value || !plan.value) return
-  await exportProjectArtifacts(parsed.value.xml, markers.value, plan.value, parsed.value.title, currentFileName.value)
+  await exportProjectArtifacts(parsed.value.xml, markers.value, plan.value, project.value?.ledger ?? null, parsed.value.title, currentFileName.value)
 }
 
 async function onPlanImport(event: Event) {
@@ -762,9 +847,12 @@ async function onPlanImport(event: Event) {
   try {
     const text = await file.text()
     const parsedJson: unknown = JSON.parse(text)
-    const isProposal = typeof parsedJson === 'object' && parsedJson !== null && (parsedJson as { schema?: string }).schema === 'rehearsal-stand-proposal/v1'
-    if (isProposal) {
+    const schemaName = typeof parsedJson === 'object' && parsedJson !== null ? (parsedJson as { schema?: string }).schema : ''
+    if (schemaName === 'rehearsal-stand-proposal/v1') {
       await onProposalImportContent(parsedJson)
+      await nextTick()
+    } else if (schemaName === 'rehearsal-stand-ledger/v1') {
+      await onLedgerImportContent(parsedJson)
       await nextTick()
     } else {
       const valid = await validateImportedPlan(parsedJson)
@@ -799,6 +887,28 @@ async function onProposalImportContent(content: unknown) {
   project.value = stored
   if (stored.plan) plan.value = plainClone(stored.plan)
   projects.value = await listProjects()
+}
+
+async function onLedgerImportContent(content: unknown) {
+  if (!project.value?.ledger || !plan.value) {
+    importMessage.value = '请先打开带方案的工程。'
+    return
+  }
+  const bundle = content as { xmlSha256?: string; ledger?: EventLedger }
+  if (bundle.xmlSha256 && bundle.xmlSha256 !== xmlHash.value) {
+    importMessage.value = '账本 XML 摘要不匹配，已拒绝导入。'
+    return
+  }
+  if (!bundle.ledger) {
+    importMessage.value = '账本文件缺少 ledger 数据。'
+    return
+  }
+  const result = importLedgerEvents(project.value.ledger as EventLedger, bundle.ledger)
+  ledgerValidation.value = await replayLedger(plan.value, project.value.ledger as EventLedger)
+  await persistProject()
+  importMessage.value = result.blocked
+    ? `账本导入：${result.applied} 条应用，${result.duplicated} 条重复，${result.quarantined.length} 条隔离并阻塞播放。`
+    : `账本导入：${result.applied} 条应用，${result.duplicated} 条重复。`
 }
 
 async function createDraftProposal() {
@@ -894,6 +1004,16 @@ async function applyPendingMerge(proposalId: string) {
   const proposal = project.value.proposals?.find((item) => item.id === proposalId)
   if (proposal) proposal.status = 'merged'
   plan.value = plainClone(project.value.plan)
+  await appendProjectLedgerEvent({
+    type: 'proposal.merge',
+    xmlSha256: xmlHash.value,
+    pathChecksum: plan.value.pathChecksum,
+    planVersion: plan.value.versions[0]?.version ?? 1,
+    summary: `合并提案：${pending.proposal.name}`,
+    entityType: 'proposal',
+    entityId: proposalId,
+    after: { proposalId, inverse: result.record.inverse.length }
+  })
   await saveProject(project.value)
 }
 
@@ -911,6 +1031,16 @@ async function undoRecord(recordId: string) {
   if (!record) return
   await undoMerge(project.value.plan, record)
   plan.value = plainClone(project.value.plan)
+  await appendProjectLedgerEvent({
+    type: 'proposal.undo',
+    xmlSha256: xmlHash.value,
+    pathChecksum: plan.value.pathChecksum,
+    planVersion: plan.value.versions[0]?.version ?? 1,
+    summary: `撤销提案合并：${record.proposalName}`,
+    entityType: 'proposal',
+    entityId: record.proposalId,
+    after: { mergeRecordId: record.id }
+  })
   await saveProject(project.value)
 }
 
@@ -1008,7 +1138,7 @@ function queuePositionText(queue: PartQueue): string {
 }
 
 async function playQueue(queue: PartQueue, restart = false) {
-  if (!plan.value) return
+  if (!plan.value || (ledgerValidation.value && !ledgerValidation.value.ok)) return
   const summary = queueSummary(queue)
   const pendingBlocked = new Set(
     (project.value?.pendingMerges ?? []).flatMap((pending) =>
@@ -1022,7 +1152,41 @@ async function playQueue(queue: PartQueue, restart = false) {
   const playback = buildQueuePlayback(queue, path.value.visits, path.value.pulses, resume)
   if (!playback) return
   const liveQueue = plan.value.queues.find((candidate) => candidate.id === queue.id) ?? queue
+  let ledger = ledgerFromProject()
+  if (!ledger) {
+    ledger = await createLedger(xmlHash.value, plan.value.pathChecksum, plan.value.versions[0]?.version ?? 1)
+    if (!project.value) {
+      const now = Date.now()
+      project.value = {
+        id: currentProjectId.value || createId(),
+        title: parsed.value?.title ?? currentFileName.value,
+        fileName: currentFileName.value,
+        xml: xml.value,
+        xmlSha256: xmlHash.value,
+        markers: markers.value,
+        plan: plan.value,
+        schemaVersion: 3,
+        createdAt: now,
+        updatedAt: now
+      }
+    }
+    project.value.ledger = ledger
+  }
   const runId = startQueueRun(liveQueue, restart)
+  if (ledger) {
+    const event = await appendLedgerEvent({
+      ledger,
+      type: 'queue.run-start',
+      xmlSha256: xmlHash.value,
+      pathChecksum: plan.value.pathChecksum,
+      planVersion: plan.value.versions[0]?.version ?? 1,
+      summary: `开始队列播放：${liveQueue.name}`,
+      entityType: 'queue',
+      entityId: liveQueue.id,
+      after: { queueId: liveQueue.id, position: liveQueue.position }
+    })
+    createCheckpoint(ledger, plan.value, event)
+  }
   await persistProject()
   const { context, metro } = ensureAudio()
   await context.resume()
@@ -1130,22 +1294,61 @@ function ensureAudio(): { context: AudioContext; metro: Metronome } {
           activePlayback.value.itemId = visit.queueItemId
         }
       },
-      onVisitEnd: (visit) => {
+      onVisitEnd: async (visit) => {
         if (!activePlayback.value?.queue || !plan.value || !visit.queueItemEnd || !visit.queueItemId) return
         const liveQueue = plan.value.queues.find((candidate) => candidate.id === activePlayback.value?.queue?.id)
         if (liveQueue && visit.queueItemId) {
-          advanceQueueItem(plan.value, liveQueue.id, visit.queueItemId, activePlayback.value.runId)
-          void persistProject()
+          const before = { position: plainClone(liveQueue.position), completions: plainClone(liveQueue.completions) }
+          const result = advanceQueueItem(plan.value, liveQueue.id, visit.queueItemId, activePlayback.value.runId)
+          if (result.status === 'finished' && !liveQueue.completedAllAt) liveQueue.completedAllAt = Date.now()
+          const ledger = ledgerFromProject()
+          if (ledger) {
+            const eventType = result.status === 'finished' ? 'queue.finished' : 'queue.item-complete'
+            const event = await appendLedgerEvent({
+              ledger,
+              type: eventType,
+              xmlSha256: xmlHash.value,
+              pathChecksum: plan.value.pathChecksum,
+              planVersion: plan.value.versions[0]?.version ?? 1,
+              summary: eventType === 'queue.finished' ? `队列完成：${liveQueue.name}` : `队列项边界完成：${visit.queueItemId}`,
+              entityType: eventType === 'queue.finished' ? 'queue' : 'queue-item',
+              entityId: eventType === 'queue.finished' ? liveQueue.id : visit.queueItemId,
+              before,
+              after: {
+                queueId: liveQueue.id,
+                position: liveQueue.position,
+                completion: liveQueue.completions.at(-1),
+                completedAllAt: liveQueue.completedAllAt
+              }
+            })
+            createCheckpoint(ledger, plan.value, event)
+          }
+          await persistProject()
         }
       },
       onStop: async (completed) => {
         playing.value = false
-        if (activePlayback.value?.queue && plan.value && activePosition.value && 'queueId' in activePosition.value) {
+        // On natural completion the final onVisitEnd already advanced state and persisted.
+        if (!completed && activePlayback.value?.queue && plan.value) {
           const queueId = activePlayback.value.queue.id
           const liveQueue = plan.value.queues.find((candidate) => candidate.id === queueId)
-          if (!completed && liveQueue) {
-            const position = { ...activePosition.value, runId: activePlayback.value.runId }
+          if (liveQueue && activePosition.value && 'queueId' in activePosition.value) {
+            const ledger = ledgerFromProject()
+            const position: QueuePosition = { ...activePosition.value, runId: activePlayback.value.runId }
             updateQueueProgress(plan.value, liveQueue.id, position)
+            if (ledger) {
+              await appendLedgerEvent({
+                ledger,
+                type: 'queue.pause',
+                xmlSha256: xmlHash.value,
+                pathChecksum: plan.value.pathChecksum,
+                planVersion: plan.value.versions[0]?.version ?? 1,
+                summary: `队列暂停：${liveQueue.name}`,
+                entityType: 'queue',
+                entityId: liveQueue.id,
+                after: { queueId: liveQueue.id, position }
+              })
+            }
           }
           await persistProject()
         }
